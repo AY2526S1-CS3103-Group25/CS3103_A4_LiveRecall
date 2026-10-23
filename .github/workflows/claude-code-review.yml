@@ -1,0 +1,56 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+
+jobs:
+  claude-review:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      id-token: write
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Review this pull request for the CS3103 LiveRecall assignment.
+            Read AGENTS.md first — it lists the assignment's hard constraints
+            and graded invariants. Then review the diff, focusing on:
+
+            1. Correctness against the graded invariants:
+               - An older revision must never overwrite a newer one (server or client).
+               - final=true is durable; no duplicate finals after reconnect/recovery.
+               - Bounded server history and bounded per-client queues (no unbounded growth).
+               - Overload policy preserves finals and the newest active revision,
+                 and returns to full-update delivery when the client catches up.
+            2. Protocol compatibility: SOURCE_HELLO / CAPTION_UPDATE / CLIENT_HELLO /
+               HISTORY field names and semantics must match the required interface;
+               unknown JSON fields must be ignored, not rejected.
+            3. Hard constraints: `python solution_server.py --port <port>` must keep
+               working; no new external-service dependencies; instructor harness files
+               (caption_source.py, load_clients.py, run_demo.py, analyse_results.py,
+               monitor_server.py, submission_check.py) must not be modified.
+            4. Concurrency bugs in asyncio code: unawaited coroutines, shared-state
+               races, tasks that can leak or block the event loop.
+
+            Post concise inline comments on specific lines for concrete issues, and
+            a short summary comment. Do not nitpick style. If the diff is clean,
+            say so briefly.
+          claude_args: |
+            --model claude-sonnet-5
+            --allowed-tools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
