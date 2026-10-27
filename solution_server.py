@@ -64,12 +64,16 @@ class SessionState:
     cannot cause duplicate or stale deliveries (a genuinely new lecture is a
     server restart).
 
-    Memory is bounded: the source finalizes segments in order, so the
-    contiguous finalized prefix is compacted to the `finalized_up_to`
-    watermark and pruned from `segments`. The dict only holds segments above
-    the watermark (normally just the active one); durability for everything
-    at or below the watermark is enforced by the single int, so late replays
-    of old finals are still rejected after pruning.
+    Memory: the contiguous finalized prefix is compacted to the
+    `finalized_up_to` watermark and pruned from `segments`; durability for
+    everything at or below the watermark is enforced by the single int, so
+    late replays of old finals are still rejected after pruning. Correctness
+    does not depend on finalization order — the watermark only advances over
+    a contiguous finalized prefix, and out-of-order segments simply stay in
+    the dict until the gap closes. The O(1) size (just the active segment)
+    relies on in-order finalization, which the spec guarantees only for the
+    starter-kit source; for any other ordering, the dict is bounded by the
+    source's own window of not-yet-finalized segments.
     """
 
     def __init__(self) -> None:
