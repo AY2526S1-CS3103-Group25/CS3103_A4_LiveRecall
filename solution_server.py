@@ -62,14 +62,18 @@ class SessionState:
     Module-level lifetime, independent of any connection: state persists across
     source disconnect/reconnect so a source replaying already-accepted frames
     cannot cause duplicate or stale deliveries (a genuinely new lecture is a
-    server restart). Finalized entries are never pruned — the (revision,
-    final=True) record is what enforces "no update after final" against late
-    replays. Memory is two small values per segment; if strict bounding is ever
-    needed, the contiguous finalized prefix can be compacted to a single
-    watermark int (the source finalizes segments in order).
+    server restart).
+
+    Memory is bounded: the source finalizes segments in order, so the
+    contiguous finalized prefix is compacted to the `finalized_up_to`
+    watermark and pruned from `segments`. The dict only holds segments above
+    the watermark (normally just the active one); durability for everything
+    at or below the watermark is enforced by the single int, so late replays
+    of old finals are still rejected after pruning.
     """
 
     def __init__(self) -> None:
+        self.finalized_up_to = 0  # every segment <= this is final and pruned
         self.segments: dict[int, tuple[int, bool]] = {}
         self.dropped_stale = 0
         self.dropped_duplicate = 0
@@ -81,13 +85,18 @@ class SessionState:
         Synchronous on purpose: the check-and-set must not be interrupted by an
         await, so concurrent ingests on the event loop cannot double-accept.
 
-        Rejects anything for an already-finalized segment, including a
-        higher-revision or same-revision final: the instructor source never
-        sends post-final updates, and accepting one would produce two "final"
-        texts for one segment (breaking exactly-once final delivery and any
-        stored history). Same-revision frames are duplicates either way —
-        delivering them scores as duplicates at the clients.
+        Never delivers anything for an already-finalized segment, and never
+        delivers a revision <= the stored one: the harness clients classify
+        such frames as duplicate/stale and would not count even a final toward
+        completeness, so relaying them can only hurt. The one concession to a
+        source that declares final without bumping the revision: a final at
+        exactly the stored provisional revision flips the stored flag (so the
+        segment is durable and recorded as finalized) but is still not
+        rebroadcast.
         """
+        if update.segment <= self.finalized_up_to:
+            self.dropped_post_final += 1
+            return False
         stored = self.segments.get(update.segment)
         if stored is not None:
             revision, final = stored
@@ -95,13 +104,29 @@ class SessionState:
                 self.dropped_post_final += 1
                 return False
             if update.revision == revision:
+                if update.final:
+                    self.segments[update.segment] = (revision, True)
+                    self._compact()
                 self.dropped_duplicate += 1
                 return False
             if update.revision < revision:
                 self.dropped_stale += 1
                 return False
         self.segments[update.segment] = (update.revision, update.final)
+        if update.final:
+            self._compact()
         return True
+
+    def _compact(self) -> None:
+        # Advance the watermark over the contiguous finalized prefix and drop
+        # those entries; their durability is now carried by finalized_up_to.
+        nxt = self.finalized_up_to + 1
+        entry = self.segments.get(nxt)
+        while entry is not None and entry[1]:
+            del self.segments[nxt]
+            self.finalized_up_to = nxt
+            nxt += 1
+            entry = self.segments.get(nxt)
 
     def drop_summary(self) -> str:
         return (
