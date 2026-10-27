@@ -72,9 +72,16 @@ class SessionState:
     a contiguous finalized prefix, and out-of-order segments simply stay in
     the dict until the gap closes. The O(1) size (just the active segment)
     relies on in-order finalization, which the spec guarantees only for the
-    starter-kit source; for any other ordering, the dict is bounded by the
-    source's own window of not-yet-finalized segments.
+    starter-kit source; for any other ordering the dict grows with the
+    source's unfinalized window, hard-capped at MAX_TRACKED_SEGMENTS by
+    force-closing the oldest tracked segments.
     """
+
+    # Hard cap on tracked (unpruned) segments. The instructor source keeps the
+    # window at ~1 active segment; the cap only matters if one segment never
+    # finalizes (e.g. its final frame was malformed and dropped), which would
+    # otherwise stall the watermark and let later entries accumulate forever.
+    MAX_TRACKED_SEGMENTS = 1024
 
     def __init__(self) -> None:
         self.finalized_up_to = 0  # every segment <= this is final and pruned
@@ -82,6 +89,7 @@ class SessionState:
         self.dropped_stale = 0
         self.dropped_duplicate = 0
         self.dropped_post_final = 0
+        self.force_closed = 0
 
     def apply(self, update: CaptionUpdate) -> bool:
         """Record the update; return True if it should be delivered to clients.
@@ -90,13 +98,12 @@ class SessionState:
         await, so concurrent ingests on the event loop cannot double-accept.
 
         Never delivers anything for an already-finalized segment, and never
-        delivers a revision <= the stored one: the harness clients classify
-        such frames as duplicate/stale and would not count even a final toward
-        completeness, so relaying them can only hurt. The one concession to a
-        source that declares final without bumping the revision: a final at
-        exactly the stored provisional revision flips the stored flag (so the
-        segment is durable and recorded as finalized) but is still not
-        rebroadcast.
+        delivers a provisional at a revision <= the stored one. A final at
+        exactly the stored provisional revision IS delivered (once): finals
+        must reach every client, and a source may legally promote the last
+        provisional in place. A final at a lower revision stays rejected —
+        finalizing on it would durably bind the segment to older text than
+        clients already displayed.
         """
         if update.segment <= self.finalized_up_to:
             self.dropped_post_final += 1
@@ -111,6 +118,7 @@ class SessionState:
                 if update.final:
                     self.segments[update.segment] = (revision, True)
                     self._compact()
+                    return True
                 self.dropped_duplicate += 1
                 return False
             if update.revision < revision:
@@ -119,6 +127,8 @@ class SessionState:
         self.segments[update.segment] = (update.revision, update.final)
         if update.final:
             self._compact()
+        if len(self.segments) > self.MAX_TRACKED_SEGMENTS:
+            self._force_close_oldest()
         return True
 
     def _compact(self) -> None:
@@ -132,11 +142,26 @@ class SessionState:
             nxt += 1
             entry = self.segments.get(nxt)
 
+    def _force_close_oldest(self) -> None:
+        # A never-finalized segment stalls the watermark; cap memory by
+        # force-closing the oldest tracked segments (treated as final from
+        # here on). Loses only updates arriving > MAX_TRACKED_SEGMENTS behind
+        # the frontier — a trade required to keep server state bounded.
+        for seg in sorted(self.segments):
+            if len(self.segments) <= self.MAX_TRACKED_SEGMENTS:
+                break
+            del self.segments[seg]
+            self.force_closed += 1
+            if seg > self.finalized_up_to:
+                self.finalized_up_to = seg
+        self._compact()
+
     def drop_summary(self) -> str:
         return (
             f"dropped(stale={self.dropped_stale} "
             f"dup={self.dropped_duplicate} "
-            f"post_final={self.dropped_post_final})"
+            f"post_final={self.dropped_post_final}) "
+            f"force_closed={self.force_closed}"
         )
 
 
