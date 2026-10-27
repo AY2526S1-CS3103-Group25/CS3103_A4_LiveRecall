@@ -25,8 +25,9 @@ const recallEl = document.getElementById("recall");
 
 // One accepted caption and DOM row per segment in the single L1 session.
 const captionsBySegment = new Map();
-// Segment IDs increase at the source, so one counter prevents expired replays.
-let lastPrunedSegment = 0;
+// Remember only IDs actually pruned, for one extra retention window.
+// Expiring these records also bounds the replay guard's memory.
+const prunedSegments = new Map();
 
 let ws;
 
@@ -49,13 +50,14 @@ function renderCaption(row, msg) {
 
 function acceptCaptionUpdate(msg) {
   const current = captionsBySegment.get(msg.segment);
-  if (!current && msg.segment <= lastPrunedSegment) return;
+  if (prunedSegments.has(msg.segment)) return;
 
   if (current) {
     // Final text is durable, even if an unexpected newer update arrives.
     if (current.caption.final) return;
-    // Equal revisions are duplicates; lower revisions would regress the display.
-    if (msg.revision <= current.caption.revision) return;
+    // Never regress text; an equal-revision final may complete a provisional.
+    if (msg.revision < current.caption.revision ||
+        (msg.revision === current.caption.revision && !msg.final)) return;
   }
 
   const row = current ? current.row : document.createElement("div");
@@ -73,13 +75,17 @@ function acceptCaptionUpdate(msg) {
 }
 
 function pruneFinalizedCaptions() {
-  const cutoff = performance.now() - FINAL_RETENTION_MS;
+  const now = performance.now();
+  const cutoff = now - FINAL_RETENTION_MS;
+  for (const [segment, expiresAt] of prunedSegments) {
+    if (expiresAt <= now) prunedSegments.delete(segment);
+  }
   for (const [segment, entry] of captionsBySegment) {
     // Keep active provisional text until its final arrives.
     if (entry.caption.final && entry.finalizedAt <= cutoff) {
       entry.row.remove();
       captionsBySegment.delete(segment);
-      lastPrunedSegment = Math.max(lastPrunedSegment, segment);
+      prunedSegments.set(segment, now + FINAL_RETENTION_MS);
     }
   }
 }

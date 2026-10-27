@@ -23,11 +23,11 @@ identified that this would allow memory usage to grow throughout a lecture.
 The design was revised to remove finalized captions and their rows after about
 70 seconds, preserving the required recent window while limiting growth.
 
-A suggested exception to the revision check was also rejected after comparing
-it with the protocol: it could allow an older final to overwrite a newer
-provisional caption. The existing revision-order check was retained. These
-decisions show why suggestions needed to be assessed against the requirements
-before being accepted.
+An initial exception to the revision check was rejected because it could accept
+older finals. A refined condition was adopted: equal-revision finals may complete
+provisional captions, while older revisions remain rejected. Review also showed
+that blocking all IDs below the highest pruned segment could reject unseen
+captions. This was replaced with expiring records of only the IDs actually pruned.
 
 ## Responsibility statement
 
