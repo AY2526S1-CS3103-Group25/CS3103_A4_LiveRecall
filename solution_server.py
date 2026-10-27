@@ -27,6 +27,7 @@ import argparse
 import asyncio
 import json
 import math
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,18 +37,15 @@ import websockets
 # There is deliberately no per-client queue or recovery state here.
 CLIENTS: set[Any] = set()
 
-# Session announced by the most recent SOURCE_HELLO. Not reset on source
-# disconnect; reconnection semantics are decided by the session-state work.
-SOURCE_SESSION: str | None = None
-
 
 @dataclass(frozen=True, slots=True)
 class CaptionUpdate:
     """A validated CAPTION_UPDATE.
 
-    `raw` is the original JSON string as received, so forwarding and any
-    later history storage stay byte-exact (extra fields preserved, no
-    re-serialization drift in float formatting or key order).
+    `payload` is the JSON string forwarded to clients: the original frame
+    as received (byte-exact, extra fields preserved) unless a missing
+    `source_ts` had to be filled in, in which case it is a re-serialization
+    of the frame with the defaulted timestamp added.
     """
 
     segment: int
@@ -55,7 +53,7 @@ class CaptionUpdate:
     source_ts: float
     final: bool
     text: str
-    raw: str
+    payload: str
 
 
 def _is_positive_int(value: Any) -> bool:
@@ -63,45 +61,57 @@ def _is_positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
-def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
+def parse_caption_update(
+    msg: dict[str, Any], raw: str, session: str
+) -> CaptionUpdate | None:
     """Validate a decoded CAPTION_UPDATE; return None (and log) if malformed.
 
     Shape validation only: segment/revision monotonicity is session state,
     not ingestion. Extra/unknown fields are ignored. Never raises.
+
+    The identity fields (segment, revision, final, text) are strict: without
+    them the update cannot be displayed or deduplicated. source_ts is only
+    used for age metrics, so a missing/invalid value is defaulted to the
+    receive time rather than costing a (possibly final) caption.
     """
     reason = None
     segment = msg.get("segment")
     revision = msg.get("revision")
-    source_ts = msg.get("source_ts")
     final = msg.get("final")
     text = msg.get("text")
+    msg_session = msg.get("session")
 
     if not _is_positive_int(segment):
         reason = f"segment must be a positive int, got {segment!r}"
     elif not _is_positive_int(revision):
         reason = f"revision must be a positive int, got {revision!r}"
-    elif (
-        isinstance(source_ts, bool)
-        or not isinstance(source_ts, (int, float))
-        or not math.isfinite(source_ts)
-    ):
-        reason = f"source_ts must be a finite number, got {source_ts!r}"
     elif not isinstance(final, bool):
         reason = f"final must be a bool, got {final!r}"
     elif not isinstance(text, str):
         reason = f"text must be a string, got {text!r}"
-    else:
-        session = msg.get("session")
-        if (
-            SOURCE_SESSION is not None
-            and isinstance(session, str)
-            and session != SOURCE_SESSION
-        ):
-            reason = f"session {session!r} does not match {SOURCE_SESSION!r}"
+    elif isinstance(msg_session, str) and msg_session != session:
+        reason = f"session {msg_session!r} does not match {session!r}"
 
     if reason is not None:
         print(f"dropping malformed CAPTION_UPDATE: {reason}", flush=True)
         return None
+
+    source_ts = msg.get("source_ts")
+    payload = raw
+    if (
+        isinstance(source_ts, bool)
+        or not isinstance(source_ts, (int, float))
+        or not math.isfinite(source_ts)
+    ):
+        # Lenient: clients require a numeric source_ts, so patch the payload
+        # rather than drop an otherwise-valid (possibly final) update.
+        source_ts = time.time()
+        payload = json.dumps({**msg, "source_ts": source_ts})
+        print(
+            f"CAPTION_UPDATE segment={segment} revision={revision}: "
+            "missing/invalid source_ts, defaulted to receive time",
+            flush=True,
+        )
 
     return CaptionUpdate(
         segment=segment,
@@ -109,7 +119,7 @@ def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
         source_ts=float(source_ts),
         final=final,
         text=text,
-        raw=raw,
+        payload=payload,
     )
 
 
@@ -119,7 +129,7 @@ async def ingest_caption_update(update: CaptionUpdate) -> None:
     The session-state manager (revision dedup + broadcast policy) replaces
     this body; ingestion/parsing above stays unchanged.
     """
-    await broadcast_naively(update.raw)
+    await broadcast_naively(update.payload)
 
 
 async def broadcast_naively(raw_message: str) -> None:
@@ -143,14 +153,11 @@ async def broadcast_naively(raw_message: str) -> None:
 
 
 async def handle_source(ws, hello: dict[str, Any]) -> None:
-    global SOURCE_SESSION
-
     session = hello.get("session")
     if not isinstance(session, str) or not session:
         await ws.close(code=1008, reason="SOURCE_HELLO requires a session")
         return
 
-    SOURCE_SESSION = session
     print(f"source connected: session={session}", flush=True)
 
     try:
@@ -164,7 +171,7 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
 
             msg_type = msg.get("type")
             if msg_type == "CAPTION_UPDATE":
-                update = parse_caption_update(msg, raw)
+                update = parse_caption_update(msg, raw, session)
                 if update is None:
                     continue
                 await ingest_caption_update(update)
