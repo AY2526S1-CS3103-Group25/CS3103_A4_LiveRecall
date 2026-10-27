@@ -24,28 +24,73 @@ python solution_server.py --port 8765
 
 ## Browser client
 
-With the server running, serve the browser files in a second terminal:
+Complete the installation steps above first, then open three terminals. In each
+command block, replace `/path/to/CS3103_A4_LiveRecall` with the location of your
+project folder. The commands use the `venv` environment created during installation.
+
+### Terminal 1 - start the caption server
+
+Enter the project folder, activate the virtual environment, then start the server:
 
 ```bash
+cd "/path/to/CS3103_A4_LiveRecall"
+source venv/bin/activate
+python solution_server.py --port 8765
+```
+
+Leave this terminal running. It receives caption updates and sends them to
+connected browser clients.
+
+### Terminal 2 - serve the browser files
+
+```bash
+cd "/path/to/CS3103_A4_LiveRecall"
 python3 -m http.server 8000 --directory client
 ```
 
-Open `http://127.0.0.1:8000` in two browser tabs, then start the supplied source
-in another terminal (with the virtual environment active):
+Leave this terminal running too. Open **http://127.0.0.1:8000/** in two browser
+tabs. Both should show **Connection: connected** before starting the source.
+
+### Terminal 3 - send five caption segments
 
 ```bash
+cd "/path/to/CS3103_A4_LiveRecall"
+source venv/bin/activate
 python caption_source.py --segments 5
 ```
 
-Issue #3 implements live display: each segment has one line, newer revisions
-replace that line, and older/equal revisions are ignored. PROVISIONAL lines are
-muted and italic; FINAL lines are darker and upright. Once final, a line cannot
-be overwritten. Lines remain visible for the page session.
+The source sends five segments, then exits.
 
-For a focused check, reload both tabs before starting the source. Watch each
-segment change from provisional to final without adding duplicate lines. After
-the source finishes, each tab should contain five FINAL lines and no browser
-console errors. Recall, history merging, and automatic reconnect remain TODOs.
+Optional: add `--revision-delay 1 --segment-gap 1` to slow the updates so each
+revision is easier to see.
+
+```text
+Caption source -> caption server -> browser display
+```
+
+### Check the display
+
+1. Each segment appears as **PROVISIONAL**, using muted italic text.
+2. Newer revisions replace the text on the same line without adding duplicates.
+3. The completed segment becomes **FINAL**, using darker normal text.
+4. Both tabs should finish with exactly **five FINAL lines** and no browser
+   console errors.
+
+The display ignores older and equal revisions, protects finalized captions
+from later updates, and keeps caption lines visible for the page session.
+
+To repeat the test, reload both tabs, wait for **connected**, then run the
+Terminal 3 command again. Reloading clears the previous captions. Press
+**Ctrl+C** in Terminals 1 and 2 when finished.
+
+### Browser troubleshooting
+
+- **404: File not found:** stop Terminal 2 with **Ctrl+C**, check that it is
+  inside `CS3103_A4_LiveRecall`, then rerun its command and refresh Chrome.
+- **Not connected:** check that Terminal 1 is running on port 8765, then reload
+  the browser tabs.
+- **No captions:** open the tabs before starting the source. Reload both tabs,
+  wait for **connected**, then rerun Terminal 3.
 
 ## Public deterministic tests
 
