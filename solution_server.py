@@ -59,10 +59,11 @@ class CaptionUpdate:
 class SessionState:
     """Latest accepted (revision, final) per segment for the single live session.
 
-    Module-level lifetime, independent of any connection: state persists across
-    source disconnect/reconnect so a source replaying already-accepted frames
-    cannot cause duplicate or stale deliveries (a genuinely new lecture is a
-    server restart).
+    Module-level lifetime, independent of any connection: state persists
+    across a mid-stream source disconnect/reconnect so replayed frames stay
+    deduplicated, but resets when a new source connects after the previous
+    stream completed with SOURCE_DONE (a fresh lecture restarting at
+    segment 1 must be deliverable without a server restart).
 
     Memory: the contiguous finalized prefix is compacted to the
     `closed_up_to` watermark and pruned from `segments`; durability for
@@ -76,7 +77,10 @@ class SessionState:
     source's unfinalized window, hard-capped at MAX_TRACKED_SEGMENTS by
     force-closing the oldest tracked segments. A force-closed segment that
     never finalized stays eligible for exactly one late final (reopenable),
-    so bounding memory never costs a final caption.
+    so capping never costs a final for any segment the server actually saw;
+    the only finals forfeited are for segment numbers first appearing > 1024
+    segments behind the frontier, or gap numbers never seen before a forced
+    watermark advance.
     """
 
     # Hard cap on tracked (unpruned) segments. The instructor source keeps the
@@ -95,12 +99,31 @@ class SessionState:
         self._closed_up_to = 0  # every segment <= this is closed and pruned
         self._segments: dict[int, tuple[int, bool]] = {}
         # Force-closed segments that never finalized: their (single) late
-        # final is still accepted, so capping memory never costs a final.
+        # final is still accepted, so capping doesn't cost tracked finals.
         self._reopenable: set[int] = set()
+        self._done = False  # previous source completed with SOURCE_DONE
         self._dropped_stale = 0
         self._dropped_duplicate = 0
         self._dropped_post_final = 0
         self._force_closed = 0
+
+    def on_source_connect(self) -> None:
+        """Reset for a fresh stream iff the previous one completed.
+
+        A new SOURCE_HELLO after a SOURCE_DONE is a new lecture whose segments
+        restart at 1 — without a reset every frame would be rejected as
+        post-final. A reconnect WITHOUT a prior SOURCE_DONE (crash, network
+        drop) keeps state, so frames the source replays stay deduplicated.
+        """
+        if self._done:
+            print(
+                f"new source after SOURCE_DONE: resetting ({self.drop_summary()})",
+                flush=True,
+            )
+            self.__init__()
+
+    def on_source_done(self) -> None:
+        self._done = True
 
     def apply(self, update: CaptionUpdate) -> bool:
         """Record the update; return True if it should be delivered to clients.
@@ -346,6 +369,7 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
     # the only source over a missing label would stop every caption.
     session = hello.get("session")
     print(f"source connected: session={session!r}", flush=True)
+    SESSION.on_source_connect()
 
     try:
         async for raw in ws:
@@ -369,6 +393,7 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
                 print(f"source finished: segments={msg.get('segments')}", flush=True)
+                SESSION.on_source_done()
             else:
                 # Forward compatibility: ignore fields/messages this baseline
                 # doesn't understand rather than crashing.
