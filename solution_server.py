@@ -56,6 +56,64 @@ class CaptionUpdate:
     payload: str
 
 
+class SessionState:
+    """Latest accepted (revision, final) per segment for the single live session.
+
+    Module-level lifetime, independent of any connection: state persists across
+    source disconnect/reconnect so a source replaying already-accepted frames
+    cannot cause duplicate or stale deliveries (a genuinely new lecture is a
+    server restart). Finalized entries are never pruned — the (revision,
+    final=True) record is what enforces "no update after final" against late
+    replays. Memory is two small values per segment; if strict bounding is ever
+    needed, the contiguous finalized prefix can be compacted to a single
+    watermark int (the source finalizes segments in order).
+    """
+
+    def __init__(self) -> None:
+        self.segments: dict[int, tuple[int, bool]] = {}
+        self.dropped_stale = 0
+        self.dropped_duplicate = 0
+        self.dropped_post_final = 0
+
+    def apply(self, update: CaptionUpdate) -> bool:
+        """Record the update; return True if it should be delivered to clients.
+
+        Synchronous on purpose: the check-and-set must not be interrupted by an
+        await, so concurrent ingests on the event loop cannot double-accept.
+
+        Rejects anything for an already-finalized segment, including a
+        higher-revision or same-revision final: the instructor source never
+        sends post-final updates, and accepting one would produce two "final"
+        texts for one segment (breaking exactly-once final delivery and any
+        stored history). Same-revision frames are duplicates either way —
+        delivering them scores as duplicates at the clients.
+        """
+        stored = self.segments.get(update.segment)
+        if stored is not None:
+            revision, final = stored
+            if final:
+                self.dropped_post_final += 1
+                return False
+            if update.revision == revision:
+                self.dropped_duplicate += 1
+                return False
+            if update.revision < revision:
+                self.dropped_stale += 1
+                return False
+        self.segments[update.segment] = (update.revision, update.final)
+        return True
+
+    def drop_summary(self) -> str:
+        return (
+            f"dropped(stale={self.dropped_stale} "
+            f"dup={self.dropped_duplicate} "
+            f"post_final={self.dropped_post_final})"
+        )
+
+
+SESSION = SessionState()
+
+
 def _is_positive_int(value: Any) -> bool:
     # bool is a subclass of int, so it must be rejected explicitly.
     return isinstance(value, int) and not isinstance(value, bool) and value >= 1
@@ -159,11 +217,15 @@ def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
 
 
 async def ingest_caption_update(update: CaptionUpdate) -> None:
-    """Entry point for validated caption updates.
+    """Gate validated caption updates through the revision state, then relay.
 
-    The session-state manager (revision dedup + broadcast policy) replaces
-    this body; ingestion/parsing above stays unchanged.
+    Pipeline: parse_caption_update (shape) -> SESSION.apply (revision gate)
+    -> broadcast. State is committed before the broadcast await, so an update
+    arriving during a slow broadcast still sees it. Per-client queueing and
+    overload coalescing replace the broadcast side, not this gate.
     """
+    if not SESSION.apply(update):
+        return
     await broadcast_naively(update.payload)
 
 
@@ -221,7 +283,7 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
                 # doesn't understand rather than crashing.
                 continue
     finally:
-        print("source disconnected", flush=True)
+        print(f"source disconnected: {SESSION.drop_summary()}", flush=True)
 
 
 async def handle_client(ws, hello: dict[str, Any]) -> None:
