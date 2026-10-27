@@ -4,23 +4,30 @@
 
 ### Issue #3 - live caption display
 
-AI helped interpret the requirements, plan and implement caption revision
-replacement, distinguish provisional and final captions, and improve comments
-and documentation. It also assisted with checking the display behavior.
+AI was used as an implementation and review aid to discuss design options,
+draft parts of the caption display logic, and identify edge cases. Proposed
+changes were evaluated against the assignment's revision rules, bounded-state
+requirements, and need for simple, understandable code.
 
 ## One useful suggestion
 
-AI suggested keeping one caption row per segment and updating it when a newer
-revision arrives. This prevents duplicate lines. Browser checks confirmed that
-newer revisions replace existing text, older updates are ignored, and final
-captions remain protected.
+Keeping one caption row per segment was a useful suggestion because it allows
+newer revisions to replace existing text without duplicate lines. The approach
+was adopted with explicit checks for older revisions and finalized captions.
+Browser checks verified these behaviors.
 
 ## One suggestion that required modification
 
-AI suggested testing with the real caption source and server, but the execution
-environment blocked local server ports. Controlled caption messages were used
-to check the browser instead. This verified the display logic, but a separate
-test with the real source and server is still needed to confirm the full flow.
+The initial AI-assisted design kept every caption for the page session. Review
+identified that this would allow memory usage to grow throughout a lecture.
+The design was revised to remove finalized captions and their rows after about
+70 seconds, preserving the required recent window while limiting growth.
+
+A suggested exception to the revision check was also rejected after comparing
+it with the protocol: it could allow an older final to overwrite a newer
+provisional caption. The existing revision-order check was retained. These
+decisions show why suggestions needed to be assessed against the requirements
+before being accepted.
 
 ## Responsibility statement
 

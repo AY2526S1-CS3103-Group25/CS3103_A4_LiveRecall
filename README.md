@@ -76,8 +76,10 @@ Caption source -> caption server -> browser display
 4. Both tabs should finish with exactly **five FINAL lines** and no browser
    console errors.
 
-The display ignores older and equal revisions, protects finalized captions
-from later updates, and keeps caption lines visible for the page session.
+The display ignores older and equal revisions and protects finalized captions
+from later updates. Finalized captions remain visible for about 70 seconds,
+then their rows and stored state are removed. Provisional captions remain until
+they become final.
 
 To repeat the test, reload both tabs, wait for **connected**, then run the
 Terminal 3 command again. Reloading clears the previous captions. Press

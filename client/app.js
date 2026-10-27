@@ -6,9 +6,9 @@
  *   - sends CLIENT_HELLO
  *   - replaces accepted revisions in the same caption row
  *   - distinguishes provisional/final captions and protects finalized text
+ *   - retains recent finalized captions and removes expired rows
  *
  * Graded TODOs:
- *   - maintain >=60 s of finalized local state
  *   - implement 30 s default recall + 15/30/60 s views
  *   - automatic reconnect + correct resume state
  *   - HISTORY merge/deduplication
@@ -16,13 +16,17 @@
  */
 
 const WS_URL = "ws://127.0.0.1:8765";
+// Keep 60 seconds of finals plus a small margin; check expiry even when idle.
+const FINAL_RETENTION_MS = 70_000;
+const CLEANUP_INTERVAL_MS = 5_000;
 const statusEl = document.getElementById("status");
 const liveEl = document.getElementById("live");
 const recallEl = document.getElementById("recall");
 
 // One accepted caption and DOM row per segment in the single L1 session.
-// Keep page-session lines here; rolling recall/history is a separate TODO.
 const captionsBySegment = new Map();
+// Segment IDs increase at the source, so one counter prevents expired replays.
+let lastPrunedSegment = 0;
 
 let ws;
 
@@ -45,6 +49,7 @@ function renderCaption(row, msg) {
 
 function acceptCaptionUpdate(msg) {
   const current = captionsBySegment.get(msg.segment);
+  if (!current && msg.segment <= lastPrunedSegment) return;
 
   if (current) {
     // Final text is durable, even if an unexpected newer update arrives.
@@ -58,8 +63,25 @@ function acceptCaptionUpdate(msg) {
   if (!current) liveEl.appendChild(row);
 
   // Reuse the row so accepted revisions replace text without moving the line.
-  captionsBySegment.set(msg.segment, { caption: msg, row });
+  captionsBySegment.set(msg.segment, {
+    caption: msg,
+    row,
+    // Use local acceptance time so delayed finals still remain for 60 seconds.
+    finalizedAt: msg.final ? performance.now() : null
+  });
   liveEl.scrollTop = liveEl.scrollHeight;
+}
+
+function pruneFinalizedCaptions() {
+  const cutoff = performance.now() - FINAL_RETENTION_MS;
+  for (const [segment, entry] of captionsBySegment) {
+    // Keep active provisional text until its final arrives.
+    if (entry.caption.final && entry.finalizedAt <= cutoff) {
+      entry.row.remove();
+      captionsBySegment.delete(segment);
+      lastPrunedSegment = Math.max(lastPrunedSegment, segment);
+    }
+  }
 }
 
 function connect() {
@@ -105,4 +127,5 @@ for (const button of document.querySelectorAll("button[data-seconds]")) {
   });
 }
 
+setInterval(pruneFinalizedCaptions, CLEANUP_INTERVAL_MS);
 connect();
