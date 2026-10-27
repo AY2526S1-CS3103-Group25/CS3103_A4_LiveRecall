@@ -26,6 +26,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
+from dataclasses import dataclass
 from typing import Any
 
 import websockets
@@ -33,6 +35,91 @@ import websockets
 # Naive global set of currently connected student clients.
 # There is deliberately no per-client queue or recovery state here.
 CLIENTS: set[Any] = set()
+
+# Session announced by the most recent SOURCE_HELLO. Not reset on source
+# disconnect; reconnection semantics are decided by the session-state work.
+SOURCE_SESSION: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CaptionUpdate:
+    """A validated CAPTION_UPDATE.
+
+    `raw` is the original JSON string as received, so forwarding and any
+    later history storage stay byte-exact (extra fields preserved, no
+    re-serialization drift in float formatting or key order).
+    """
+
+    segment: int
+    revision: int
+    source_ts: float
+    final: bool
+    text: str
+    raw: str
+
+
+def _is_positive_int(value: Any) -> bool:
+    # bool is a subclass of int, so it must be rejected explicitly.
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
+    """Validate a decoded CAPTION_UPDATE; return None (and log) if malformed.
+
+    Shape validation only: segment/revision monotonicity is session state,
+    not ingestion. Extra/unknown fields are ignored. Never raises.
+    """
+    reason = None
+    segment = msg.get("segment")
+    revision = msg.get("revision")
+    source_ts = msg.get("source_ts")
+    final = msg.get("final")
+    text = msg.get("text")
+
+    if not _is_positive_int(segment):
+        reason = f"segment must be a positive int, got {segment!r}"
+    elif not _is_positive_int(revision):
+        reason = f"revision must be a positive int, got {revision!r}"
+    elif (
+        isinstance(source_ts, bool)
+        or not isinstance(source_ts, (int, float))
+        or not math.isfinite(source_ts)
+    ):
+        reason = f"source_ts must be a finite number, got {source_ts!r}"
+    elif not isinstance(final, bool):
+        reason = f"final must be a bool, got {final!r}"
+    elif not isinstance(text, str):
+        reason = f"text must be a string, got {text!r}"
+    else:
+        session = msg.get("session")
+        if (
+            SOURCE_SESSION is not None
+            and isinstance(session, str)
+            and session != SOURCE_SESSION
+        ):
+            reason = f"session {session!r} does not match {SOURCE_SESSION!r}"
+
+    if reason is not None:
+        print(f"dropping malformed CAPTION_UPDATE: {reason}", flush=True)
+        return None
+
+    return CaptionUpdate(
+        segment=segment,
+        revision=revision,
+        source_ts=float(source_ts),
+        final=final,
+        text=text,
+        raw=raw,
+    )
+
+
+async def ingest_caption_update(update: CaptionUpdate) -> None:
+    """Entry point for validated caption updates.
+
+    The session-state manager (revision dedup + broadcast policy) replaces
+    this body; ingestion/parsing above stays unchanged.
+    """
+    await broadcast_naively(update.raw)
 
 
 async def broadcast_naively(raw_message: str) -> None:
@@ -56,7 +143,14 @@ async def broadcast_naively(raw_message: str) -> None:
 
 
 async def handle_source(ws, hello: dict[str, Any]) -> None:
+    global SOURCE_SESSION
+
     session = hello.get("session")
+    if not isinstance(session, str) or not session:
+        await ws.close(code=1008, reason="SOURCE_HELLO requires a session")
+        return
+
+    SOURCE_SESSION = session
     print(f"source connected: session={session}", flush=True)
 
     try:
@@ -65,16 +159,19 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(msg, dict):
+                continue
 
             msg_type = msg.get("type")
             if msg_type == "CAPTION_UPDATE":
-                # Baseline behavior: forward exactly what was received.
-                # No history, state, validation, coalescing, or bounded queues.
-                await broadcast_naively(raw)
+                update = parse_caption_update(msg, raw)
+                if update is None:
+                    continue
+                await ingest_caption_update(update)
             elif msg_type == "SOURCE_DONE":
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
-                print("source finished", flush=True)
+                print(f"source finished: segments={msg.get('segments')}", flush=True)
             else:
                 # Forward compatibility: ignore fields/messages this baseline
                 # doesn't understand rather than crashing.
@@ -108,6 +205,9 @@ async def handler(ws) -> None:
         raw = await asyncio.wait_for(ws.recv(), timeout=5)
         hello = json.loads(raw)
     except (asyncio.TimeoutError, json.JSONDecodeError):
+        await ws.close(code=1008, reason="Expected a valid hello message")
+        return
+    if not isinstance(hello, dict):
         await ws.close(code=1008, reason="Expected a valid hello message")
         return
 
