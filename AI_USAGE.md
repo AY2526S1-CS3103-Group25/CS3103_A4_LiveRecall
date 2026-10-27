@@ -29,6 +29,11 @@ provisional captions, while older revisions remain rejected. Review also showed
 that blocking all IDs below the highest pruned segment could reject unseen
 captions. This was replaced with expiring records of only the IDs actually pruned.
 
+Further review identified abandoned provisional captions as another source of
+growth. Cleanup now removes older, superseded provisionals after 70 seconds
+without an accepted update, while preserving the newest active caption and
+allowing late finals. Reconnect recovery remains separate work.
+
 ## Responsibility statement
 
 We understand that the team remains responsible for the submitted code, experimental results, and claims, and that every member may be asked to explain or modify relevant code during the viva.

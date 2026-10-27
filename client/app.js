@@ -6,7 +6,7 @@
  *   - sends CLIENT_HELLO
  *   - replaces accepted revisions in the same caption row
  *   - distinguishes provisional/final captions and protects finalized text
- *   - retains recent finalized captions and removes expired rows
+ *   - removes expired finals and abandoned provisional rows
  *
  * Graded TODOs:
  *   - implement 30 s default recall + 15/30/60 s views
@@ -17,7 +17,7 @@
 
 const WS_URL = "ws://127.0.0.1:8765";
 // Keep 60 seconds of finals plus a small margin; check expiry even when idle.
-const FINAL_RETENTION_MS = 70_000;
+const CAPTION_RETENTION_MS = 70_000;
 const CLEANUP_INTERVAL_MS = 5_000;
 const statusEl = document.getElementById("status");
 const liveEl = document.getElementById("live");
@@ -25,9 +25,11 @@ const recallEl = document.getElementById("recall");
 
 // One accepted caption and DOM row per segment in the single L1 session.
 const captionsBySegment = new Map();
-// Remember only IDs actually pruned, for one extra retention window.
-// Expiring these records also bounds the replay guard's memory.
+// Keep only revision/finality for recently pruned captions, without text or rows.
+// These records expire after one extra retention window.
 const prunedSegments = new Map();
+// Used only for cleanup: older provisionals may be abandoned as the stream moves on.
+let latestSegment = 0;
 
 let ws;
 
@@ -50,14 +52,14 @@ function renderCaption(row, msg) {
 
 function acceptCaptionUpdate(msg) {
   const current = captionsBySegment.get(msg.segment);
-  if (prunedSegments.has(msg.segment)) return;
+  const previous = current ? current.caption : prunedSegments.get(msg.segment);
 
-  if (current) {
+  if (previous) {
     // Final text is durable, even if an unexpected newer update arrives.
-    if (current.caption.final) return;
+    if (previous.final) return;
     // Never regress text; an equal-revision final may complete a provisional.
-    if (msg.revision < current.caption.revision ||
-        (msg.revision === current.caption.revision && !msg.final)) return;
+    if (msg.revision < previous.revision ||
+        (msg.revision === previous.revision && !msg.final)) return;
   }
 
   const row = current ? current.row : document.createElement("div");
@@ -68,24 +70,32 @@ function acceptCaptionUpdate(msg) {
   captionsBySegment.set(msg.segment, {
     caption: msg,
     row,
-    // Use local acceptance time so delayed finals still remain for 60 seconds.
-    finalizedAt: msg.final ? performance.now() : null
+    // Only accepted updates refresh the clock; finals get their full local window.
+    lastUpdatedAt: performance.now()
   });
+  // A late final or newer revision can restore a pruned provisional caption.
+  prunedSegments.delete(msg.segment);
+  latestSegment = Math.max(latestSegment, msg.segment);
   liveEl.scrollTop = liveEl.scrollHeight;
 }
 
-function pruneFinalizedCaptions() {
+function pruneExpiredCaptions() {
   const now = performance.now();
-  const cutoff = now - FINAL_RETENTION_MS;
-  for (const [segment, expiresAt] of prunedSegments) {
-    if (expiresAt <= now) prunedSegments.delete(segment);
+  const cutoff = now - CAPTION_RETENTION_MS;
+  for (const [segment, entry] of prunedSegments) {
+    if (entry.expiresAt <= now) prunedSegments.delete(segment);
   }
   for (const [segment, entry] of captionsBySegment) {
-    // Keep active provisional text until its final arrives.
-    if (entry.caption.final && entry.finalizedAt <= cutoff) {
+    // Preserve the newest active caption, but expire older idle provisionals.
+    const canExpire = entry.caption.final || segment < latestSegment;
+    if (canExpire && entry.lastUpdatedAt <= cutoff) {
       entry.row.remove();
       captionsBySegment.delete(segment);
-      prunedSegments.set(segment, now + FINAL_RETENTION_MS);
+      prunedSegments.set(segment, {
+        revision: entry.caption.revision,
+        final: entry.caption.final,
+        expiresAt: now + CAPTION_RETENTION_MS
+      });
     }
   }
 }
@@ -100,7 +110,7 @@ function connect() {
       type: "CLIENT_HELLO",
       client_id: numericClientId(),
       session: "L1",
-      last_segment: 0,       // TODO: resume latest finalized state
+      last_segment: 0,       // TODO (#4): resume from the latest final held locally.
       last_revision: 0,
       history_seconds: 30
     }));
@@ -133,5 +143,5 @@ for (const button of document.querySelectorAll("button[data-seconds]")) {
   });
 }
 
-setInterval(pruneFinalizedCaptions, CLEANUP_INTERVAL_MS);
+setInterval(pruneExpiredCaptions, CLEANUP_INTERVAL_MS);
 connect();

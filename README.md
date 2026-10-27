@@ -79,10 +79,15 @@ Caption source -> caption server -> browser display
 The display ignores older revisions and repeated provisional updates. A final
 update at the same revision can complete a provisional caption; accepted final
 captions remain protected from later updates. Finalized captions remain visible
-for about 70 seconds, then their rows and stored state are removed. Provisional
-captions remain until they become final. Only IDs of captions actually removed
-are temporarily remembered to prevent immediate replays; these records also
-expire after about 70 seconds.
+for about 70 seconds, then their rows and stored state are removed. Older
+provisional captions are also removed if they receive no accepted updates for
+70 seconds and the stream has moved to a later segment. The newest active
+caption is preserved, and a late final or newer revision can restore a removed
+provisional caption. Only the revision and final status of removed captions are
+temporarily remembered to reject stale updates; these records also expire after
+about 70 seconds. This guard does not implement reconnect recovery or history
+merging; the reconnect follow-up must send the actual latest finalized segment
+and revision in `CLIENT_HELLO`.
 
 To repeat the test, reload both tabs, wait for **connected**, then run the
 Terminal 3 command again. Reloading clears the previous captions. Press
