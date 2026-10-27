@@ -61,9 +61,7 @@ def _is_positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
-def parse_caption_update(
-    msg: dict[str, Any], raw: str, session: str
-) -> CaptionUpdate | None:
+def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
     """Validate a decoded CAPTION_UPDATE; return None (and log) if malformed.
 
     Shape validation only: segment/revision monotonicity is session state,
@@ -72,14 +70,16 @@ def parse_caption_update(
     The identity fields (segment, revision, final, text) are strict: without
     them the update cannot be displayed or deduplicated. source_ts is only
     used for age metrics, so a missing/invalid value is defaulted to the
-    receive time rather than costing a (possibly final) caption.
+    receive time rather than costing a (possibly final) caption. The update's
+    `session` field is not checked: the session is identified by the source
+    connection's SOURCE_HELLO, and the spec doesn't require per-update
+    session matching.
     """
     reason = None
     segment = msg.get("segment")
     revision = msg.get("revision")
     final = msg.get("final")
     text = msg.get("text")
-    msg_session = msg.get("session")
 
     if not _is_positive_int(segment):
         reason = f"segment must be a positive int, got {segment!r}"
@@ -89,8 +89,6 @@ def parse_caption_update(
         reason = f"final must be a bool, got {final!r}"
     elif not isinstance(text, str):
         reason = f"text must be a string, got {text!r}"
-    elif isinstance(msg_session, str) and msg_session != session:
-        reason = f"session {msg_session!r} does not match {session!r}"
 
     if reason is not None:
         print(f"dropping malformed CAPTION_UPDATE: {reason}", flush=True)
@@ -171,7 +169,7 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
 
             msg_type = msg.get("type")
             if msg_type == "CAPTION_UPDATE":
-                update = parse_caption_update(msg, raw, session)
+                update = parse_caption_update(msg, raw)
                 if update is None:
                     continue
                 await ingest_caption_update(update)
