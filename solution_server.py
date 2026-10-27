@@ -65,7 +65,7 @@ class SessionState:
     server restart).
 
     Memory: the contiguous finalized prefix is compacted to the
-    `finalized_up_to` watermark and pruned from `segments`; durability for
+    `closed_up_to` watermark and pruned from `segments`; durability for
     everything at or below the watermark is enforced by the single int, so
     late replays of old finals are still rejected after pruning. Correctness
     does not depend on finalization order — the watermark only advances over
@@ -85,8 +85,14 @@ class SessionState:
     # otherwise stall the watermark and let later entries accumulate forever.
     MAX_TRACKED_SEGMENTS = 1024
 
+    # Hard cap on remembered force-closed-but-never-finalized segments (the
+    # ones still eligible for one late final). Only reachable under an
+    # adversarial flood of never-finalized segments; beyond it, the oldest
+    # lose their late-final eligibility.
+    MAX_REOPENABLE_SEGMENTS = 1024
+
     def __init__(self) -> None:
-        self.finalized_up_to = 0  # every segment <= this is closed and pruned
+        self.closed_up_to = 0  # every segment <= this is closed and pruned
         self.segments: dict[int, tuple[int, bool]] = {}
         # Force-closed segments that never finalized: their (single) late
         # final is still accepted, so capping memory never costs a final.
@@ -110,7 +116,7 @@ class SessionState:
         finalizing on it would durably bind the segment to older text than
         clients already displayed.
         """
-        if update.segment <= self.finalized_up_to:
+        if update.segment <= self.closed_up_to:
             if update.final and update.segment in self.reopenable:
                 # The late final of a force-closed, never-finalized segment:
                 # deliver it exactly once; replays then hit the reject below.
@@ -143,12 +149,12 @@ class SessionState:
 
     def _compact(self) -> None:
         # Advance the watermark over the contiguous finalized prefix and drop
-        # those entries; their durability is now carried by finalized_up_to.
-        nxt = self.finalized_up_to + 1
+        # those entries; their durability is now carried by closed_up_to.
+        nxt = self.closed_up_to + 1
         entry = self.segments.get(nxt)
         while entry is not None and entry[1]:
             del self.segments[nxt]
-            self.finalized_up_to = nxt
+            self.closed_up_to = nxt
             nxt += 1
             entry = self.segments.get(nxt)
 
@@ -166,11 +172,11 @@ class SessionState:
             self.force_closed += 1
             if not final:
                 self.reopenable.add(seg)
-            if seg > self.finalized_up_to:
-                self.finalized_up_to = seg
+            if seg > self.closed_up_to:
+                self.closed_up_to = seg
         # Bound the reopen set too (relevant only under adversarial floods of
         # never-finalized segments); oldest entries are the ones given up.
-        while len(self.reopenable) > self.MAX_TRACKED_SEGMENTS:
+        while len(self.reopenable) > self.MAX_REOPENABLE_SEGMENTS:
             self.reopenable.discard(min(self.reopenable))
         self._compact()
 
