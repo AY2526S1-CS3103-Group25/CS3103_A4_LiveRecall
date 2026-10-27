@@ -24,7 +24,28 @@ python solution_server.py --port 8765
 
 ## Browser client
 
-Exact commands/steps.
+With the server running, serve the browser files in a second terminal:
+
+```bash
+python3 -m http.server 8000 --directory client
+```
+
+Open `http://127.0.0.1:8000` in two browser tabs, then start the supplied source
+in another terminal (with the virtual environment active):
+
+```bash
+python caption_source.py --segments 5
+```
+
+Issue #3 implements live display: each segment has one line, newer revisions
+replace that line, and older/equal revisions are ignored. PROVISIONAL lines are
+muted and italic; FINAL lines are darker and upright. Once final, a line cannot
+be overwritten. Lines remain visible for the page session.
+
+For a focused check, reload both tabs before starting the source. Watch each
+segment change from provisional to final without adding duplicate lines. After
+the source finishes, each tab should contain five FINAL lines and no browser
+console errors. Recall, history merging, and automatic reconnect remain TODOs.
 
 ## Public deterministic tests
 

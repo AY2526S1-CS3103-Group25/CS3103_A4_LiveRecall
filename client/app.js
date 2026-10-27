@@ -1,14 +1,13 @@
 /*
- * Working but deliberately naive LiveRecall browser starter.
+ * LiveRecall browser client: live revision display (issue #3).
  *
- * Provided mechanical behavior:
+ * Implemented behavior:
  *   - opens a WebSocket
  *   - sends CLIENT_HELLO
- *   - visibly appends every received CAPTION_UPDATE
- *   - displays whether an update is provisional/final
+ *   - replaces accepted revisions in the same caption row
+ *   - distinguishes provisional/final captions and protects finalized text
  *
  * Graded TODOs:
- *   - replace revisions rather than appending duplicates
  *   - maintain >=60 s of finalized local state
  *   - implement 30 s default recall + 15/30/60 s views
  *   - automatic reconnect + correct resume state
@@ -20,6 +19,10 @@ const WS_URL = "ws://127.0.0.1:8765";
 const statusEl = document.getElementById("status");
 const liveEl = document.getElementById("live");
 const recallEl = document.getElementById("recall");
+
+// One accepted caption and DOM row per segment in the single L1 session.
+// Keep page-session lines here; rolling recall/history is a separate TODO.
+const captionsBySegment = new Map();
 
 let ws;
 
@@ -33,12 +36,29 @@ function numericClientId() {
   return Number(value);
 }
 
-function appendNaively(msg) {
-  const row = document.createElement("div");
-  row.className = "naive-line";
+function renderCaption(row, msg) {
   const state = msg.final ? "FINAL" : "PROVISIONAL";
+  row.className = `caption-line ${msg.final ? "caption-final" : "caption-provisional"}`;
+  // Treat source text as text, never as HTML.
   row.textContent = `[${state}] segment ${msg.segment} rev ${msg.revision}: ${msg.text}`;
-  liveEl.appendChild(row);
+}
+
+function acceptCaptionUpdate(msg) {
+  const current = captionsBySegment.get(msg.segment);
+
+  if (current) {
+    // Final text is durable, even if an unexpected newer update arrives.
+    if (current.caption.final) return;
+    // Equal revisions are duplicates; lower revisions would regress the display.
+    if (msg.revision <= current.caption.revision) return;
+  }
+
+  const row = current ? current.row : document.createElement("div");
+  renderCaption(row, msg);
+  if (!current) liveEl.appendChild(row);
+
+  // Reuse the row so accepted revisions replace text without moving the line.
+  captionsBySegment.set(msg.segment, { caption: msg, row });
   liveEl.scrollTop = liveEl.scrollHeight;
 }
 
@@ -61,7 +81,7 @@ function connect() {
   ws.addEventListener("message", (event) => {
     const msg = JSON.parse(event.data);
     if (msg.type === "CAPTION_UPDATE") {
-      appendNaively(msg);
+      acceptCaptionUpdate(msg);
     } else if (msg.type === "HISTORY") {
       console.log(`HISTORY with ${msg.items?.length ?? 0} item(s)`, msg);
       // TODO: merge history without stale/duplicate final captions.
