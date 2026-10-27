@@ -76,6 +76,7 @@ Caption source -> caption server -> browser display
 4. Both tabs should finish with exactly **five FINAL lines** and no browser
    console errors.
 
+Caption rows stay in segment order, including captions restored by late updates.
 The display ignores older revisions and repeated provisional updates. A final
 update at the same revision can complete a provisional caption; accepted final
 captions remain protected from later updates. Finalized captions remain visible

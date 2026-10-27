@@ -64,7 +64,13 @@ function acceptCaptionUpdate(msg) {
 
   const row = current ? current.row : document.createElement("div");
   renderCaption(row, msg);
-  if (!current) liveEl.appendChild(row);
+  if (!current) {
+    // Late or restored captions belong in segment order, not arrival order.
+    row.dataset.segment = String(msg.segment);
+    const nextRow = Array.from(liveEl.children)
+      .find(existing => Number(existing.dataset.segment) > msg.segment);
+    liveEl.insertBefore(row, nextRow || null);
+  }
 
   // Reuse the row so accepted revisions replace text without moving the line.
   captionsBySegment.set(msg.segment, {

@@ -32,7 +32,8 @@ captions. This was replaced with expiring records of only the IDs actually prune
 Further review identified abandoned provisional captions as another source of
 growth. Cleanup now removes older, superseded provisionals after 70 seconds
 without an accepted update, while preserving the newest active caption and
-allowing late finals. Reconnect recovery remains separate work.
+allowing late finals. Restored rows are inserted by segment number to preserve
+display order. Reconnect recovery remains separate work.
 
 ## Responsibility statement
 
