@@ -74,7 +74,9 @@ class SessionState:
     relies on in-order finalization, which the spec guarantees only for the
     starter-kit source; for any other ordering the dict grows with the
     source's unfinalized window, hard-capped at MAX_TRACKED_SEGMENTS by
-    force-closing the oldest tracked segments.
+    force-closing the oldest tracked segments. A force-closed segment that
+    never finalized stays eligible for exactly one late final (reopenable),
+    so bounding memory never costs a final caption.
     """
 
     # Hard cap on tracked (unpruned) segments. The instructor source keeps the
@@ -84,8 +86,11 @@ class SessionState:
     MAX_TRACKED_SEGMENTS = 1024
 
     def __init__(self) -> None:
-        self.finalized_up_to = 0  # every segment <= this is final and pruned
+        self.finalized_up_to = 0  # every segment <= this is closed and pruned
         self.segments: dict[int, tuple[int, bool]] = {}
+        # Force-closed segments that never finalized: their (single) late
+        # final is still accepted, so capping memory never costs a final.
+        self.reopenable: set[int] = set()
         self.dropped_stale = 0
         self.dropped_duplicate = 0
         self.dropped_post_final = 0
@@ -106,6 +111,11 @@ class SessionState:
         clients already displayed.
         """
         if update.segment <= self.finalized_up_to:
+            if update.final and update.segment in self.reopenable:
+                # The late final of a force-closed, never-finalized segment:
+                # deliver it exactly once; replays then hit the reject below.
+                self.reopenable.discard(update.segment)
+                return True
             self.dropped_post_final += 1
             return False
         stored = self.segments.get(update.segment)
@@ -144,16 +154,24 @@ class SessionState:
 
     def _force_close_oldest(self) -> None:
         # A never-finalized segment stalls the watermark; cap memory by
-        # force-closing the oldest tracked segments (treated as final from
-        # here on). Loses only updates arriving > MAX_TRACKED_SEGMENTS behind
-        # the frontier — a trade required to keep server state bounded.
+        # force-closing the oldest tracked segments. A closed segment that
+        # never finalized stays acceptable for exactly one late final (via
+        # `reopenable`), so the cap bounds state without losing finals; only
+        # its provisional revision history is forgotten, which risks at most
+        # re-relaying a replayed provisional, never a duplicate final.
         for seg in sorted(self.segments):
             if len(self.segments) <= self.MAX_TRACKED_SEGMENTS:
                 break
-            del self.segments[seg]
+            _, final = self.segments.pop(seg)
             self.force_closed += 1
+            if not final:
+                self.reopenable.add(seg)
             if seg > self.finalized_up_to:
                 self.finalized_up_to = seg
+        # Bound the reopen set too (relevant only under adversarial floods of
+        # never-finalized segments); oldest entries are the ones given up.
+        while len(self.reopenable) > self.MAX_TRACKED_SEGMENTS:
+            self.reopenable.discard(min(self.reopenable))
         self._compact()
 
     def drop_summary(self) -> str:
