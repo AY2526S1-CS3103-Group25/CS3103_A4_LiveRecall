@@ -43,9 +43,9 @@ class CaptionUpdate:
     """A validated CAPTION_UPDATE.
 
     `payload` is the JSON string forwarded to clients: the original frame
-    as received (byte-exact, extra fields preserved) unless a missing
-    `source_ts` had to be filled in, in which case it is a re-serialization
-    of the frame with the defaulted timestamp added.
+    as received (byte-exact, extra fields preserved) unless a lenient field
+    (`source_ts`, `text`) had to be defaulted, in which case it is a
+    re-serialization of the frame with the defaults filled in.
     """
 
     segment: int
@@ -67,10 +67,11 @@ def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
     Shape validation only: segment/revision monotonicity is session state,
     not ingestion. Extra/unknown fields are ignored. Never raises.
 
-    The identity fields (segment, revision, final, text) are strict: without
-    them the update cannot be displayed or deduplicated. source_ts is only
-    used for age metrics, so a missing/invalid value is defaulted to the
-    receive time rather than costing a (possibly final) caption. The update's
+    The identity fields (segment, revision, final) are strict: without them
+    the update cannot be displayed or deduplicated. source_ts (only used for
+    age metrics) and text (display content) are lenient — a missing/invalid
+    value is defaulted and the payload patched, because dropping a possibly
+    final caption over a non-identity field is unrecoverable. The update's
     `session` field is not checked: the session is identified by the source
     connection's SOURCE_HELLO, and the spec doesn't require per-update
     session matching.
@@ -87,27 +88,30 @@ def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
         reason = f"revision must be a positive int, got {revision!r}"
     elif not isinstance(final, bool):
         reason = f"final must be a bool, got {final!r}"
-    elif not isinstance(text, str):
-        reason = f"text must be a string, got {text!r}"
 
     if reason is not None:
         print(f"dropping malformed CAPTION_UPDATE: {reason}", flush=True)
         return None
 
     source_ts = msg.get("source_ts")
-    payload = raw
+    patched: dict[str, Any] = {}
     if (
         isinstance(source_ts, bool)
         or not isinstance(source_ts, (int, float))
         or not math.isfinite(source_ts)
     ):
-        # Lenient: clients require a numeric source_ts, so patch the payload
-        # rather than drop an otherwise-valid (possibly final) update.
         source_ts = time.time()
-        payload = json.dumps({**msg, "source_ts": source_ts})
+        patched["source_ts"] = source_ts
+    if not isinstance(text, str):
+        text = ""
+        patched["text"] = text
+
+    payload = raw
+    if patched:
+        payload = json.dumps({**msg, **patched})
         print(
             f"CAPTION_UPDATE segment={segment} revision={revision}: "
-            "missing/invalid source_ts, defaulted to receive time",
+            f"defaulted missing/invalid {', '.join(patched)}",
             flush=True,
         )
 
@@ -151,12 +155,11 @@ async def broadcast_naively(raw_message: str) -> None:
 
 
 async def handle_source(ws, hello: dict[str, Any]) -> None:
+    # The session value is logged but not required: the server runs a single
+    # session, SOURCE_HELLO's type already routes the connection, and refusing
+    # the only source over a missing label would stop every caption.
     session = hello.get("session")
-    if not isinstance(session, str) or not session:
-        await ws.close(code=1008, reason="SOURCE_HELLO requires a session")
-        return
-
-    print(f"source connected: session={session}", flush=True)
+    print(f"source connected: session={session!r}", flush=True)
 
     try:
         async for raw in ws:
