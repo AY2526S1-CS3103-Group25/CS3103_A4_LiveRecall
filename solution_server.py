@@ -92,15 +92,15 @@ class SessionState:
     MAX_REOPENABLE_SEGMENTS = 1024
 
     def __init__(self) -> None:
-        self.closed_up_to = 0  # every segment <= this is closed and pruned
-        self.segments: dict[int, tuple[int, bool]] = {}
+        self._closed_up_to = 0  # every segment <= this is closed and pruned
+        self._segments: dict[int, tuple[int, bool]] = {}
         # Force-closed segments that never finalized: their (single) late
         # final is still accepted, so capping memory never costs a final.
-        self.reopenable: set[int] = set()
-        self.dropped_stale = 0
-        self.dropped_duplicate = 0
-        self.dropped_post_final = 0
-        self.force_closed = 0
+        self._reopenable: set[int] = set()
+        self._dropped_stale = 0
+        self._dropped_duplicate = 0
+        self._dropped_post_final = 0
+        self._force_closed = 0
 
     def apply(self, update: CaptionUpdate) -> bool:
         """Record the update; return True if it should be delivered to clients.
@@ -116,76 +116,89 @@ class SessionState:
         finalizing on it would durably bind the segment to older text than
         clients already displayed.
         """
-        if update.segment <= self.closed_up_to:
-            if update.final and update.segment in self.reopenable:
-                # The late final of a force-closed, never-finalized segment:
-                # deliver it exactly once; replays then hit the reject below.
-                self.reopenable.discard(update.segment)
-                return True
-            self.dropped_post_final += 1
-            return False
-        stored = self.segments.get(update.segment)
+        if update.segment <= self._closed_up_to:
+            return self._apply_to_closed(update)
+        stored = self._segments.get(update.segment)
         if stored is not None:
-            revision, final = stored
-            if final:
-                self.dropped_post_final += 1
-                return False
-            if update.revision == revision:
-                if update.final:
-                    self.segments[update.segment] = (revision, True)
-                    self._compact()
-                    return True
-                self.dropped_duplicate += 1
-                return False
-            if update.revision < revision:
-                self.dropped_stale += 1
-                return False
-        self.segments[update.segment] = (update.revision, update.final)
+            return self._apply_to_tracked(update, *stored)
+        self._track(update)
+        return True
+
+    def _apply_to_closed(self, update: CaptionUpdate) -> bool:
+        # The late final of a force-closed, never-finalized segment is
+        # delivered exactly once; everything else below the watermark is dead.
+        if update.final and update.segment in self._reopenable:
+            self._reopenable.discard(update.segment)
+            return True
+        self._dropped_post_final += 1
+        return False
+
+    def _apply_to_tracked(
+        self, update: CaptionUpdate, revision: int, final: bool
+    ) -> bool:
+        if final:
+            self._dropped_post_final += 1
+            return False
+        if update.revision == revision:
+            if update.final:
+                # Promote-in-place: the final reuses the provisional's
+                # revision number; deliver it once and close the segment.
+                self._track(update)
+                return True
+            self._dropped_duplicate += 1
+            return False
+        if update.revision < revision:
+            self._dropped_stale += 1
+            return False
+        self._track(update)
+        return True
+
+    def _track(self, update: CaptionUpdate) -> None:
+        self._segments[update.segment] = (update.revision, update.final)
         if update.final:
             self._compact()
-        if len(self.segments) > self.MAX_TRACKED_SEGMENTS:
+        if len(self._segments) > self.MAX_TRACKED_SEGMENTS:
             self._force_close_oldest()
-        return True
 
     def _compact(self) -> None:
         # Advance the watermark over the contiguous finalized prefix and drop
-        # those entries; their durability is now carried by closed_up_to.
-        nxt = self.closed_up_to + 1
-        entry = self.segments.get(nxt)
+        # those entries; their durability is now carried by _closed_up_to.
+        nxt = self._closed_up_to + 1
+        entry = self._segments.get(nxt)
         while entry is not None and entry[1]:
-            del self.segments[nxt]
-            self.closed_up_to = nxt
+            del self._segments[nxt]
+            self._closed_up_to = nxt
             nxt += 1
-            entry = self.segments.get(nxt)
+            entry = self._segments.get(nxt)
 
     def _force_close_oldest(self) -> None:
         # A never-finalized segment stalls the watermark; cap memory by
         # force-closing the oldest tracked segments. A closed segment that
         # never finalized stays acceptable for exactly one late final (via
-        # `reopenable`), so the cap bounds state without losing finals; only
+        # `_reopenable`), so the cap bounds state without losing finals; only
         # its provisional revision history is forgotten, which risks at most
         # re-relaying a replayed provisional, never a duplicate final.
-        for seg in sorted(self.segments):
-            if len(self.segments) <= self.MAX_TRACKED_SEGMENTS:
+        for seg in sorted(self._segments):
+            if len(self._segments) <= self.MAX_TRACKED_SEGMENTS:
                 break
-            _, final = self.segments.pop(seg)
-            self.force_closed += 1
+            _, final = self._segments.pop(seg)
+            self._force_closed += 1
             if not final:
-                self.reopenable.add(seg)
-            if seg > self.closed_up_to:
-                self.closed_up_to = seg
+                self._reopenable.add(seg)
+            if seg > self._closed_up_to:
+                self._closed_up_to = seg
         # Bound the reopen set too (relevant only under adversarial floods of
         # never-finalized segments); oldest entries are the ones given up.
-        while len(self.reopenable) > self.MAX_REOPENABLE_SEGMENTS:
-            self.reopenable.discard(min(self.reopenable))
+        while len(self._reopenable) > self.MAX_REOPENABLE_SEGMENTS:
+            self._reopenable.discard(min(self._reopenable))
         self._compact()
 
     def drop_summary(self) -> str:
         return (
-            f"dropped(stale={self.dropped_stale} "
-            f"dup={self.dropped_duplicate} "
-            f"post_final={self.dropped_post_final}) "
-            f"force_closed={self.force_closed}"
+            f"dropped(stale={self._dropped_stale} "
+            f"dup={self._dropped_duplicate} "
+            f"post_final={self._dropped_post_final}) "
+            f"force_closed={self._force_closed}"
         )
 
 
