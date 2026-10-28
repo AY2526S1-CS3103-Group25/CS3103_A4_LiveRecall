@@ -26,6 +26,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
+import time
+from dataclasses import dataclass
 from typing import Any
 
 import websockets
@@ -33,6 +36,135 @@ import websockets
 # Naive global set of currently connected student clients.
 # There is deliberately no per-client queue or recovery state here.
 CLIENTS: set[Any] = set()
+
+
+@dataclass(frozen=True, slots=True)
+class CaptionUpdate:
+    """A validated CAPTION_UPDATE.
+
+    `payload` is the JSON string forwarded to clients: the original frame
+    as received (byte-exact, extra fields preserved) unless a lenient field
+    (`source_ts`, `text`) had to be defaulted, in which case it is a
+    re-serialization of the frame with the defaults filled in.
+    """
+
+    segment: int
+    revision: int
+    source_ts: float
+    final: bool
+    text: str
+    payload: str
+
+
+def _is_positive_int(value: Any) -> bool:
+    # bool is a subclass of int, so it must be rejected explicitly.
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def _finite_float(value: Any) -> float | None:
+    """Coerce a JSON number to a finite float, or None if it is not one.
+
+    JSON integers have arbitrary precision, so the conversion to a C double
+    can itself overflow (`float(10 ** 400)` raises OverflowError, and so does
+    `math.isfinite` on the same value). The guard keeps an absurd timestamp a
+    dropped field rather than an exception that would kill the connection.
+    """
+    # bool is a subclass of int, so it must be rejected explicitly.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _decode_source_frame(raw: str | bytes) -> tuple[Any, str | bytes]:
+    """Decode a source frame into (message, payload to forward).
+
+    `json.loads` accepts the JavaScript-only `NaN`/`Infinity`/`-Infinity`
+    literals and `json.dumps` re-emits them, but they are not valid JSON:
+    a browser's `JSON.parse` rejects the entire frame, so a caption carrying
+    one in any field — including an unknown extra one we never look at —
+    would be lost. When such a literal is seen it is replaced with null and
+    the payload re-serialized. `parse_constant` fires only in that case, so
+    ordinary frames keep their byte-exact payload and pay nothing.
+    """
+    seen: list[str] = []
+    msg = json.loads(raw, parse_constant=lambda name: seen.append(name) or None)
+    if not seen:
+        return msg, raw
+    print(f"rewrote non-JSON literal(s) to null: {', '.join(seen)}", flush=True)
+    return msg, json.dumps(msg)
+
+
+def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
+    """Validate a decoded CAPTION_UPDATE; return None (and log) if malformed.
+
+    Shape validation only: segment/revision monotonicity is session state,
+    not ingestion. Extra/unknown fields are ignored. Never raises.
+
+    The identity fields (segment, revision, final) are strict: without them
+    the update cannot be displayed or deduplicated. source_ts (only used for
+    age metrics) and text (display content) are lenient — a missing/invalid
+    value is defaulted and the payload patched, because dropping a possibly
+    final caption over a non-identity field is unrecoverable. The update's
+    `session` field is not checked: the session is identified by the source
+    connection's SOURCE_HELLO, and the spec doesn't require per-update
+    session matching.
+    """
+    reason = None
+    segment = msg.get("segment")
+    revision = msg.get("revision")
+    final = msg.get("final")
+    text = msg.get("text")
+
+    if not _is_positive_int(segment):
+        reason = f"segment must be a positive int, got {segment!r}"
+    elif not _is_positive_int(revision):
+        reason = f"revision must be a positive int, got {revision!r}"
+    elif not isinstance(final, bool):
+        reason = f"final must be a bool, got {final!r}"
+
+    if reason is not None:
+        print(f"dropping malformed CAPTION_UPDATE: {reason}", flush=True)
+        return None
+
+    source_ts = _finite_float(msg.get("source_ts"))
+    patched: dict[str, Any] = {}
+    if source_ts is None:
+        source_ts = time.time()
+        patched["source_ts"] = source_ts
+    if not isinstance(text, str):
+        text = ""
+        patched["text"] = text
+
+    payload = raw
+    if patched:
+        payload = json.dumps({**msg, **patched})
+        print(
+            f"CAPTION_UPDATE segment={segment} revision={revision}: "
+            f"defaulted missing/invalid {', '.join(patched)}",
+            flush=True,
+        )
+
+    return CaptionUpdate(
+        segment=segment,
+        revision=revision,
+        source_ts=source_ts,
+        final=final,
+        text=text,
+        payload=payload,
+    )
+
+
+async def ingest_caption_update(update: CaptionUpdate) -> None:
+    """Entry point for validated caption updates.
+
+    The session-state manager (revision dedup + broadcast policy) replaces
+    this body; ingestion/parsing above stays unchanged.
+    """
+    await broadcast_naively(update.payload)
 
 
 async def broadcast_naively(raw_message: str) -> None:
@@ -56,25 +188,34 @@ async def broadcast_naively(raw_message: str) -> None:
 
 
 async def handle_source(ws, hello: dict[str, Any]) -> None:
+    # The session value is logged but not required: the server runs a single
+    # session, SOURCE_HELLO's type already routes the connection, and refusing
+    # the only source over a missing label would stop every caption.
     session = hello.get("session")
-    print(f"source connected: session={session}", flush=True)
+    print(f"source connected: session={session!r}", flush=True)
 
     try:
         async for raw in ws:
             try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
+                msg, raw = _decode_source_frame(raw)
+            except ValueError:
+                # JSONDecodeError for malformed JSON, UnicodeDecodeError if the
+                # frame arrived as binary with invalid UTF-8. Both subclass
+                # ValueError; neither should drop the source connection.
+                continue
+            if not isinstance(msg, dict):
                 continue
 
             msg_type = msg.get("type")
             if msg_type == "CAPTION_UPDATE":
-                # Baseline behavior: forward exactly what was received.
-                # No history, state, validation, coalescing, or bounded queues.
-                await broadcast_naively(raw)
+                update = parse_caption_update(msg, raw)
+                if update is None:
+                    continue
+                await ingest_caption_update(update)
             elif msg_type == "SOURCE_DONE":
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
-                print("source finished", flush=True)
+                print(f"source finished: segments={msg.get('segments')}", flush=True)
             else:
                 # Forward compatibility: ignore fields/messages this baseline
                 # doesn't understand rather than crashing.
@@ -107,7 +248,12 @@ async def handler(ws) -> None:
     try:
         raw = await asyncio.wait_for(ws.recv(), timeout=5)
         hello = json.loads(raw)
-    except (asyncio.TimeoutError, json.JSONDecodeError):
+    except (asyncio.TimeoutError, ValueError):
+        # ValueError covers JSONDecodeError and UnicodeDecodeError (a binary
+        # hello frame with invalid UTF-8).
+        await ws.close(code=1008, reason="Expected a valid hello message")
+        return
+    if not isinstance(hello, dict):
         await ws.close(code=1008, reason="Expected a valid hello message")
         return
 
