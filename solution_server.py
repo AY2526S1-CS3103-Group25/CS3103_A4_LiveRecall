@@ -32,9 +32,8 @@ from typing import Any
 
 import websockets
 
-# Per-client locks order HISTORY before live sends. Bounded sender queues and
-# slow-client isolation remain separate work (issues #9/#10).
-CLIENTS: dict[Any, asyncio.Lock] = {}
+# Each connection owns its bounded pending work and its sole network sender.
+CLIENTS: dict[Any, ClientState] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -402,42 +401,57 @@ def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
     )
 
 
-async def ingest_caption_update(update: CaptionUpdate) -> None:
-    """Gate validated caption updates through the revision state, then relay.
+class ClientState:
+    # Bound both object count and payload bytes. HISTORY is one initial,
+    # time-bounded snapshot; the sender also holds at most one in-flight frame.
+    MAX_PENDING = 128
+    MAX_PENDING_BYTES = 256 * 1024
 
-    Pipeline: parse_caption_update (shape) -> SESSION.apply (revision gate)
-    -> broadcast. State is committed before the broadcast await, so an update
-    arriving during a slow broadcast still sees it. Per-client queueing and
-    overload coalescing replace the broadcast side, not this gate.
-    """
+    def __init__(self, ws) -> None:
+        self.ws = ws
+        self.pending: deque[tuple[CaptionUpdate, int, float]] = deque()
+        self.pending_bytes = 0
+        self.ready = asyncio.Event()
+        self.failed = asyncio.Event()
+        self.failure_reason = ""
+
+    def fail(self, reason: str) -> None:
+        self.failure_reason = reason
+        self.failed.set()
+
+    def offer(self, update: CaptionUpdate) -> None:
+        if self.failed.is_set():
+            return
+        size = len(update.payload.encode("utf-8")) if isinstance(update.payload, str) else len(update.payload)
+        if len(self.pending) >= self.MAX_PENDING or self.pending_bytes + size > self.MAX_PENDING_BYTES:
+            self.fail("Pending delivery limit reached")
+            return
+        self.pending.append((update, size, time.monotonic()))
+        self.pending_bytes += size
+        self.ready.set()
+
+    async def run(self, history: str) -> None:
+        await self.ws.send(history)
+        del history  # do not retain the initial snapshot throughout the lecture
+        while not self.failed.is_set():
+            if not self.pending:
+                self.ready.clear()
+                await self.ready.wait()
+                continue
+            update, size, _ = self.pending.popleft()
+            self.pending_bytes -= size
+            await self.ws.send(update.payload)
+            # send() need not yield on an unconstrained socket. Give ingestion
+            # and other client senders a turn even while draining a full queue.
+            await asyncio.sleep(0)
+
+
+async def ingest_caption_update(update: CaptionUpdate) -> None:
+    """Commit accepted state and offer work without awaiting client I/O."""
     if not SESSION.apply(update):
         return
-    await broadcast_naively(update.payload)
-
-
-async def broadcast_naively(raw_message: str) -> None:
-    """Send one message directly to every connected client.
-
-    This is intentionally a naive baseline. The source handler waits for all
-    sends to complete. Under pressure, this design may accumulate delay and is
-    not the target architecture for the assignment.
-    """
-    if not CLIENTS:
-        return
-
-    snapshot = list(CLIENTS.items())
-    results = await asyncio.gather(
-        *(send_live(client, lock, raw_message) for client, lock in snapshot),
-        return_exceptions=True,
-    )
-    for (client, _), result in zip(snapshot, results):
-        if isinstance(result, Exception):
-            CLIENTS.pop(client, None)
-
-
-async def send_live(ws, lock: asyncio.Lock, raw_message: str) -> None:
-    async with lock:
-        await ws.send(raw_message)
+    for client in CLIENTS.values():
+        client.offer(update)
 
 
 async def handle_source(ws, hello: dict[str, Any]) -> None:
@@ -487,22 +501,36 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
     last_revision = last_revision if _is_positive_int(last_revision) else 0
     seconds = _finite_float(hello.get("history_seconds"))
     seconds = 30 if seconds is None else min(60, max(0, seconds))
-    lock = asyncio.Lock()
-    try:
-        async with lock:
-            # No await between snapshot and registration: each accepted final
-            # belongs either to HISTORY or to subsequent live delivery. Holding
-            # this lock across the send prevents live frames overtaking HISTORY.
-            items = SESSION.history_items(last_segment, last_revision, seconds)
-            CLIENTS[ws] = lock
-            await ws.send(json.dumps({"type": "HISTORY", "items": items}))
-        print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
-        # Student clients normally don't send further messages after hello.
-        # Keep the WebSocket open until the client disconnects.
+    # Snapshot and registration are synchronous. The sender owns HISTORY and
+    # every subsequent live send; source ingestion never waits for either.
+    items = SESSION.history_items(last_segment, last_revision, seconds)
+    client = ClientState(ws)
+    CLIENTS[ws] = client
+    sender = asyncio.create_task(client.run(json.dumps({"type": "HISTORY", "items": items})))
+    del items
+
+    async def receive() -> None:
         async for _ in ws:
             pass
+
+    reader = asyncio.create_task(receive())
+    failure = asyncio.create_task(client.failed.wait())
+    print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+    try:
+        done, _ = await asyncio.wait((sender, reader, failure), return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
     finally:
         CLIENTS.pop(ws, None)
+        # Closing first releases a blocked send without cancelling a partially
+        # transmitted WebSocket message. Cancellation is only final cleanup.
+        try:
+            await ws.close(code=1013 if client.failure_reason else 1000,
+                           reason=client.failure_reason)
+        finally:
+            for task in (sender, reader, failure):
+                task.cancel()
+            await asyncio.gather(sender, reader, failure, return_exceptions=True)
         print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
 
 
@@ -540,6 +568,8 @@ async def main_async(port: int) -> None:
         "0.0.0.0",
         port,
         max_size=2**20,
+        write_limit=16 * 1024,
+        close_timeout=5,
         ping_interval=20,
         ping_timeout=20,
     ):
