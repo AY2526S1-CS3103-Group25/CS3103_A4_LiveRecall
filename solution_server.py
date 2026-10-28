@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
 """
-CS3103 Assignment 4 - LiveRecall naive working baseline.
+CS3103 Assignment 4 - LiveRecall revision-aware caption server.
 
-This starter is intentionally useful but incomplete. It provides the required
-CLI and a basic WebSocket broadcaster so that caption_source.py -> server ->
-browser/load clients works on day one.
-
-It DOES NOT implement the graded networking mechanisms:
-  - bounded per-client application queues
-  - slow-client isolation
-  - semantic coalescing / backpressure
-  - constrained-bandwidth overload handling
+Bounded recent history and per-client delivery preserve finalized captions while
+coalescing obsolete provisional revisions only when a client falls behind.
 
 Required evaluator command:
     python solution_server.py --port 8765
@@ -31,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import websockets
+from websockets.exceptions import ConnectionClosed
 
 # Each connection owns its bounded pending work and its sole network sender.
 CLIENTS: dict[Any, ClientState] = {}
@@ -111,6 +105,12 @@ class SessionState:
         # Receipt order permits O(1) expiry, independently of source clock skew
         # or out-of-order finals. Revision compaction must not erase payloads.
         self._history: deque[tuple[float, CaptionUpdate]] = deque()
+        # Receipt-order final positions let senders recover even out-of-order
+        # segment finals, without a growing per-client set of delivered IDs.
+        self._final_sequence = 0
+        self._expired_sequence = 0
+        self._active: dict[int, CaptionUpdate] = {}
+        self.generation = object()
         self._done = False  # previous source completed with SOURCE_DONE
         # A CAPTION_UPDATE arrived since the last SOURCE_HELLO: the fallback
         # reset in apply() may only fire before this flips (a new stream's
@@ -215,6 +215,8 @@ class SessionState:
                 self._dropped_duplicate += 1
                 return False
         self._segments[seg] = (update.revision, update.final)
+        if not update.final:
+            self._active[seg] = update
         if update.final:
             self._remember_final(update)
             self._compact()
@@ -224,12 +226,15 @@ class SessionState:
 
     def _remember_final(self, update: CaptionUpdate) -> None:
         self.prune_history()
+        self._active.pop(update.segment, None)
+        self._final_sequence += 1
         self._history.append((time.monotonic(), update))
 
     def prune_history(self) -> None:
         cutoff = time.monotonic() - self.HISTORY_RETENTION_SECONDS
         while self._history and self._history[0][0] <= cutoff:
             self._history.popleft()
+            self._expired_sequence += 1
 
     def history_items(
         self, last_segment: int, last_revision: int, history_seconds: float
@@ -276,6 +281,7 @@ class SessionState:
             if len(self._segments) <= self.MAX_TRACKED_SEGMENTS:
                 break
             _, final = self._segments.pop(seg)
+            self._active.pop(seg, None)
             self._force_closed += 1
             if not final:
                 self._reopenable.add(seg)
@@ -402,47 +408,152 @@ def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
 
 
 class ClientState:
-    # Bound both object count and payload bytes. HISTORY is one initial,
-    # time-bounded snapshot; the sender also holds at most one in-flight frame.
+    # Live pending work is capped by count and UTF-8 bytes. One initial HISTORY
+    # snapshot (bounded by the history window) and one in-flight frame are extra.
+    # Oversized valid frames use catch-up's single-frame path, never the queue.
     MAX_PENDING = 128
     MAX_PENDING_BYTES = 256 * 1024
+    LAG_SECONDS = 0.100
+    RECOVER_SECONDS = 0.050
 
     def __init__(self, ws) -> None:
         self.ws = ws
-        self.pending: deque[tuple[CaptionUpdate, int, float]] = deque()
+        self.pending: deque[tuple[CaptionUpdate, int, float, int]] = deque()
         self.pending_bytes = 0
         self.ready = asyncio.Event()
         self.failed = asyncio.Event()
         self.failure_reason = ""
+        self.generation = SESSION.generation
+        # Start at the snapshot/live boundary, not the HELLO cursor: context
+        # excluded by history_seconds must not reappear during overload recovery.
+        self.final_cursor = SESSION._final_sequence
+        self.sent_active: dict[int, int] = {}
+        self.lagging = False
+        self.catch_up = False
+        self.send_started: float | None = None
+        self.in_flight_sequence = 0
+        self.last_send_seconds = 0.0
+        self.coalesced = 0
+        self.catch_ups = 0
 
     def fail(self, reason: str) -> None:
         self.failure_reason = reason
         self.failed.set()
 
-    def offer(self, update: CaptionUpdate) -> None:
+    def check_recovery(self) -> None:
+        if self.generation is not SESSION.generation:
+            self.fail("Source stream restarted; reconnect")
+        elif self.catch_up and max(self.final_cursor, self.in_flight_sequence) < SESSION._expired_sequence:
+            self.fail("Final recovery window expired; reconnect")
+
+    def _observe_lag(self) -> None:
+        now = time.monotonic()
+        if ((self.send_started is not None and now - self.send_started >= self.LAG_SECONDS)
+                or (self.pending and now - self.pending[0][2] >= self.LAG_SECONDS)
+                or len(self.pending) >= self.MAX_PENDING * 3 // 4
+                or self.pending_bytes >= self.MAX_PENDING_BYTES * 3 // 4):
+            self.lagging = True
+        if self.lagging:
+            # Keep the last pending update per segment. An accepted final
+            # supersedes its provisionals; the revision gate forbids two finals.
+            seen = set()
+            kept = deque()
+            for entry in reversed(self.pending):
+                if entry[0].segment not in seen:
+                    seen.add(entry[0].segment)
+                    kept.appendleft(entry)
+            self.coalesced += len(self.pending) - len(kept)
+            self.pending = kept
+            self.pending_bytes = sum(entry[1] for entry in kept)
+
+    def offer(self, update: CaptionUpdate, size: int) -> None:
+        self.check_recovery()
         if self.failed.is_set():
             return
-        size = len(update.payload.encode("utf-8")) if isinstance(update.payload, str) else len(update.payload)
-        if len(self.pending) >= self.MAX_PENDING or self.pending_bytes + size > self.MAX_PENDING_BYTES:
-            self.fail("Pending delivery limit reached")
+        if self.catch_up:
+            self.ready.set()
             return
-        self.pending.append((update, size, time.monotonic()))
-        self.pending_bytes += size
+        self._observe_lag()
+        sequence = SESSION._final_sequence if update.final else 0
+        # Compact with the incoming frame before enforcing the hard bound.
+        # The temporary entry is local and never becomes an unbounded backlog.
+        if self.lagging:
+            retained = deque(entry for entry in self.pending if entry[0].segment != update.segment)
+            self.coalesced += len(self.pending) - len(retained)
+            self.pending = retained
+            self.pending_bytes = sum(entry[1] for entry in retained)
+        if len(self.pending) >= self.MAX_PENDING or self.pending_bytes + size > self.MAX_PENDING_BYTES:
+            self.pending.clear()
+            self.pending_bytes = 0
+            self.catch_up = self.lagging = True
+            self.catch_ups += 1
+        else:
+            self.pending.append((update, size, time.monotonic(), sequence))
+            self.pending_bytes += size
         self.ready.set()
 
+    def _next_recovery(self) -> tuple[CaptionUpdate, int] | None:
+        SESSION.prune_history()
+        self.check_recovery()
+        if self.failed.is_set():
+            return None
+        if self.final_cursor < SESSION._final_sequence:
+            # Recover one final at a time; no private replay copy or full-lecture
+            # transcript. The in-flight final advances the cursor only on success.
+            index = self.final_cursor - SESSION._expired_sequence
+            return SESSION._history[index][1], self.final_cursor + 1
+        for segment in sorted(SESSION._active):
+            update = SESSION._active[segment]
+            if self.sent_active.get(segment, 0) < update.revision:
+                return update, 0
+        self.catch_up = False
+        if self.last_send_seconds < self.RECOVER_SECONDS:
+            self.lagging = False
+        return None
+
+    async def _send(self, payload: str, sequence: int = 0) -> None:
+        self.send_started = time.monotonic()
+        self.in_flight_sequence = sequence
+        try:
+            await self.ws.send(payload)
+        finally:
+            self.last_send_seconds = time.monotonic() - self.send_started
+            self.send_started = None
+            self.in_flight_sequence = 0
+
     async def run(self, history: str) -> None:
-        await self.ws.send(history)
-        del history  # do not retain the initial snapshot throughout the lecture
+        await self._send(history)
+        del history
         while not self.failed.is_set():
-            if not self.pending:
+            self.check_recovery()
+            if self.failed.is_set():
+                break
+            self._observe_lag()
+            recovery = self._next_recovery() if self.catch_up else None
+            if recovery is not None:
+                update, sequence = recovery
+            elif self.pending:
+                update, size, _, sequence = self.pending.popleft()
+                self.pending_bytes -= size
+            else:
                 self.ready.clear()
                 await self.ready.wait()
                 continue
-            update, size, _ = self.pending.popleft()
-            self.pending_bytes -= size
-            await self.ws.send(update.payload)
-            # send() need not yield on an unconstrained socket. Give ingestion
-            # and other client senders a turn even while draining a full queue.
+            await self._send(update.payload, sequence)
+            if update.final:
+                self.final_cursor = sequence
+                self.sent_active.pop(update.segment, None)
+            else:
+                self.sent_active[update.segment] = update.revision
+                if len(self.sent_active) > SESSION.MAX_TRACKED_SEGMENTS:
+                    self.sent_active = {s: r for s, r in self.sent_active.items() if s in SESSION._active}
+            # Hysteresis: resume full coverage only with little fresh queued work
+            # and a fast completed send. Keep a single stalled send per client.
+            if (not self.catch_up and len(self.pending) <= self.MAX_PENDING // 4
+                    and self.pending_bytes <= self.MAX_PENDING_BYTES // 4
+                    and self.last_send_seconds < self.RECOVER_SECONDS
+                    and (not self.pending or time.monotonic() - self.pending[0][2] < self.RECOVER_SECONDS)):
+                self.lagging = False
             await asyncio.sleep(0)
 
 
@@ -450,8 +561,9 @@ async def ingest_caption_update(update: CaptionUpdate) -> None:
     """Commit accepted state and offer work without awaiting client I/O."""
     if not SESSION.apply(update):
         return
+    size = len(update.payload.encode("utf-8")) if isinstance(update.payload, str) else len(update.payload)
     for client in CLIENTS.values():
-        client.offer(update)
+        client.offer(update, size)
 
 
 async def handle_source(ws, hello: dict[str, Any]) -> None:
@@ -520,6 +632,8 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
         done, _ = await asyncio.wait((sender, reader, failure), return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             task.result()
+    except ConnectionClosed:
+        pass
     finally:
         CLIENTS.pop(ws, None)
         # Closing first releases a blocked send without cancelling a partially
@@ -531,7 +645,9 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
             for task in (sender, reader, failure):
                 task.cancel()
             await asyncio.gather(sender, reader, failure, return_exceptions=True)
-        print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+        print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}; "
+              f"coalesced={client.coalesced}; catch_ups={client.catch_ups}; "
+              f"reason={client.failure_reason!r}", flush=True)
 
 
 async def handler(ws) -> None:
@@ -560,6 +676,8 @@ async def prune_history_periodically() -> None:
     while True:
         await asyncio.sleep(5)
         SESSION.prune_history()
+        for client in CLIENTS.values():
+            client.check_recovery()
 
 
 async def main_async(port: int) -> None:
@@ -573,7 +691,7 @@ async def main_async(port: int) -> None:
         ping_interval=20,
         ping_timeout=20,
     ):
-        print(f"LiveRecall baseline listening on ws://0.0.0.0:{port}", flush=True)
+        print(f"LiveRecall listening on ws://0.0.0.0:{port}", flush=True)
         cleanup = asyncio.create_task(prune_history_periodically())
         try:
             await asyncio.Future()
