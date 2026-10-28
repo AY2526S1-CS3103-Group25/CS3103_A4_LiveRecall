@@ -65,10 +65,11 @@ class SessionState:
     stream completed with SOURCE_DONE (a fresh lecture restarting at
     segment 1 must be deliverable without a server restart). SOURCE_DONE is
     not guaranteed — a source killed mid-stream never sends it — so there is
-    a fallback: a provisional segment-1 revision-1 frame arriving after
-    segment 1 has closed also resets, since a conforming source numbers
-    segments monotonically from 1 and such a frame can only start a new
-    stream (see apply()).
+    a fallback: a provisional segment-1 revision-1 frame arriving as the
+    first frame after a SOURCE_HELLO, while segment 1 is already closed,
+    also resets, since a conforming source numbers segments monotonically
+    from 1 and a new stream's s1r1 can only sit in that position (see
+    apply()).
 
     Memory: the contiguous finalized prefix is compacted to the
     `closed_up_to` watermark and pruned from `segments`; durability for
@@ -107,6 +108,10 @@ class SessionState:
         # final is still accepted, so capping doesn't cost tracked finals.
         self._reopenable: set[int] = set()
         self._done = False  # previous source completed with SOURCE_DONE
+        # A CAPTION_UPDATE arrived since the last SOURCE_HELLO: the fallback
+        # reset in apply() may only fire before this flips (a new stream's
+        # s1r1 can only ever be a connection's first frame).
+        self._stream_started = False
         self._dropped_stale = 0
         self._dropped_duplicate = 0
         self._dropped_post_final = 0
@@ -128,6 +133,7 @@ class SessionState:
                 flush=True,
             )
             self.__init__()
+        self._stream_started = False
 
     def on_source_done(self) -> None:
         self._done = True
@@ -139,16 +145,22 @@ class SessionState:
         await, so concurrent ingests on the event loop cannot double-accept.
 
         New-stream fallback (before the ladder): a provisional segment-1
-        revision-1 frame after segment 1 has closed resets the session. A
-        conforming source numbers segments monotonically from 1, so within
-        one stream that frame cannot reappear once segment 1 closed; it can
-        only begin a new stream whose predecessor was killed before sending
-        SOURCE_DONE (e.g. Ctrl-C, then rerun against the same server).
-        Without the reset the whole new lecture would be silently dropped as
-        post-final. Deliberately narrow: a FINAL s1r1 never triggers it (so a
-        replayed reopenable late final can't wipe live state), and a
-        reopenable segment 1 is excluded (its late final must stay
-        deliverable).
+        revision-1 frame that is the FIRST frame after a SOURCE_HELLO, while
+        segment 1 is already closed, resets the session. A conforming source
+        numbers segments monotonically from 1, so a new stream's s1r1 can
+        only sit in that exact position; it means the previous stream's
+        source was killed before sending SOURCE_DONE (e.g. Ctrl-C, then
+        rerun against the same server), and without the reset the whole new
+        lecture would be silently dropped as post-final. Deliberately
+        narrow: once any frame has arrived on the connection the fallback is
+        disarmed (a mid-stream or mid-replay s1r1 retransmit can never wipe
+        state), a FINAL s1r1 never triggers it (so a replayed reopenable
+        late final can't either), and a reopenable segment 1 is excluded
+        (its late final must stay deliverable). The one case this misreads —
+        a reconnecting source that replays its whole stream from s1r1 — is
+        informationally indistinguishable from a new lecture, and treating
+        it as one re-broadcasts duplicates instead of silencing a real
+        lecture; no harness component replays at all.
 
         Reject ladder, top to bottom:
         - closed segment (<= watermark): dead, except the single late final
@@ -165,18 +177,20 @@ class SessionState:
         """
         seg = update.segment
         if (
-            seg == 1
+            not self._stream_started
+            and seg == 1
             and update.revision == 1
             and not update.final
             and self._closed_up_to >= 1
             and 1 not in self._reopenable
         ):
             print(
-                "segment 1 revision 1 after segment 1 closed: treating as a "
-                f"new stream, resetting ({self.drop_summary()})",
+                "stream opens at segment 1 revision 1 but segment 1 is closed: "
+                f"treating as a new stream, resetting ({self.drop_summary()})",
                 flush=True,
             )
             self.__init__()
+        self._stream_started = True
         if seg <= self._closed_up_to:
             if update.final and seg in self._reopenable:
                 self._reopenable.discard(seg)
