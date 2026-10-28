@@ -7,8 +7,6 @@ CLI and a basic WebSocket broadcaster so that caption_source.py -> server ->
 browser/load clients works on day one.
 
 It DOES NOT implement the graded networking mechanisms:
-  - revision-state management or deduplication
-  - recent-history recovery or late-join recovery
   - bounded per-client application queues
   - slow-client isolation
   - semantic coalescing / backpressure
@@ -28,14 +26,15 @@ import asyncio
 import json
 import math
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
 import websockets
 
-# Naive global set of currently connected student clients.
-# There is deliberately no per-client queue or recovery state here.
-CLIENTS: set[Any] = set()
+# Per-client locks order HISTORY before live sends. Bounded sender queues and
+# slow-client isolation remain separate work (issues #9/#10).
+CLIENTS: dict[Any, asyncio.Lock] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,7 +56,7 @@ class CaptionUpdate:
 
 
 class SessionState:
-    """Latest accepted (revision, final) per segment for the single live session.
+    """Revision metadata and recent finalized captions for the single session.
 
     Module-level lifetime, independent of any connection: state persists
     across a mid-stream source disconnect/reconnect so replayed frames stay
@@ -101,12 +100,18 @@ class SessionState:
     # lose their late-final eligibility.
     MAX_REOPENABLE_SEGMENTS = 1024
 
+    # Cover the required 60-second recovery window plus a small margin.
+    HISTORY_RETENTION_SECONDS = 70
+
     def __init__(self) -> None:
         self._closed_up_to = 0  # every segment <= this is closed and pruned
         self._segments: dict[int, tuple[int, bool]] = {}
         # Force-closed segments that never finalized: their (single) late
         # final is still accepted, so capping doesn't cost tracked finals.
         self._reopenable: set[int] = set()
+        # Receipt order permits O(1) expiry, independently of source clock skew
+        # or out-of-order finals. Revision compaction must not erase payloads.
+        self._history: deque[tuple[float, CaptionUpdate]] = deque()
         self._done = False  # previous source completed with SOURCE_DONE
         # A CAPTION_UPDATE arrived since the last SOURCE_HELLO: the fallback
         # reset in apply() may only fire before this flips (a new stream's
@@ -194,6 +199,7 @@ class SessionState:
         if seg <= self._closed_up_to:
             if update.final and seg in self._reopenable:
                 self._reopenable.discard(seg)
+                self._remember_final(update)
                 return True
             self._dropped_post_final += 1
             return False
@@ -211,10 +217,43 @@ class SessionState:
                 return False
         self._segments[seg] = (update.revision, update.final)
         if update.final:
+            self._remember_final(update)
             self._compact()
         if len(self._segments) > self.MAX_TRACKED_SEGMENTS:
             self._force_close_oldest()
         return True
+
+    def _remember_final(self, update: CaptionUpdate) -> None:
+        self.prune_history()
+        self._history.append((time.monotonic(), update))
+
+    def prune_history(self) -> None:
+        cutoff = time.monotonic() - self.HISTORY_RETENTION_SECONDS
+        while self._history and self._history[0][0] <= cutoff:
+            self._history.popleft()
+
+    def history_items(
+        self, last_segment: int, last_revision: int, history_seconds: float
+    ) -> list[dict[str, Any]]:
+        """Snapshot missed finals in segment order, within source event time.
+
+        The cursor reports the latest finalized state held by the client.
+        Monotonic receipt time bounds storage even for future source timestamps;
+        source_ts selects the requested recent lecture context without changing
+        the original event timestamps or extra fields.
+        """
+        self.prune_history()
+        if history_seconds <= 0:
+            return []
+        cutoff = time.time() - history_seconds
+        updates = [
+            update for _, update in self._history
+            if update.source_ts >= cutoff
+            and (update.segment, update.revision) > (last_segment, last_revision)
+        ]
+        return [json.loads(update.payload) for update in sorted(
+            updates, key=lambda update: update.segment
+        )]
 
     def _compact(self) -> None:
         # Advance the watermark over the contiguous finalized prefix and drop
@@ -386,14 +425,19 @@ async def broadcast_naively(raw_message: str) -> None:
     if not CLIENTS:
         return
 
-    snapshot = list(CLIENTS)
+    snapshot = list(CLIENTS.items())
     results = await asyncio.gather(
-        *(client.send(raw_message) for client in snapshot),
+        *(send_live(client, lock, raw_message) for client, lock in snapshot),
         return_exceptions=True,
     )
-    for client, result in zip(snapshot, results):
+    for (client, _), result in zip(snapshot, results):
         if isinstance(result, Exception):
-            CLIENTS.discard(client)
+            CLIENTS.pop(client, None)
+
+
+async def send_live(ws, lock: asyncio.Lock, raw_message: str) -> None:
+    async with lock:
+        await ws.send(raw_message)
 
 
 async def handle_source(ws, hello: dict[str, Any]) -> None:
@@ -437,21 +481,28 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
 
 async def handle_client(ws, hello: dict[str, Any]) -> None:
     client_id = hello.get("client_id")
-
-    # The baseline has no stored recovery state. Sending an empty HISTORY makes
-    # the connection behavior visible and keeps the starter easy to inspect.
-    # Students must implement correct HISTORY semantics for the assignment.
-    await ws.send(json.dumps({"type": "HISTORY", "items": []}))
-
-    CLIENTS.add(ws)
-    print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+    last_segment = hello.get("last_segment", 0)
+    last_revision = hello.get("last_revision", 0)
+    last_segment = last_segment if _is_positive_int(last_segment) else 0
+    last_revision = last_revision if _is_positive_int(last_revision) else 0
+    seconds = _finite_float(hello.get("history_seconds"))
+    seconds = 30 if seconds is None else min(60, max(0, seconds))
+    lock = asyncio.Lock()
     try:
+        async with lock:
+            # No await between snapshot and registration: each accepted final
+            # belongs either to HISTORY or to subsequent live delivery. Holding
+            # this lock across the send prevents live frames overtaking HISTORY.
+            items = SESSION.history_items(last_segment, last_revision, seconds)
+            CLIENTS[ws] = lock
+            await ws.send(json.dumps({"type": "HISTORY", "items": items}))
+        print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
         # Student clients normally don't send further messages after hello.
         # Keep the WebSocket open until the client disconnects.
         async for _ in ws:
             pass
     finally:
-        CLIENTS.discard(ws)
+        CLIENTS.pop(ws, None)
         print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
 
 
@@ -477,6 +528,12 @@ async def handler(ws) -> None:
         await ws.close(code=1008, reason="Expected SOURCE_HELLO or CLIENT_HELLO")
 
 
+async def prune_history_periodically() -> None:
+    while True:
+        await asyncio.sleep(5)
+        SESSION.prune_history()
+
+
 async def main_async(port: int) -> None:
     async with websockets.serve(
         handler,
@@ -487,7 +544,12 @@ async def main_async(port: int) -> None:
         ping_timeout=20,
     ):
         print(f"LiveRecall baseline listening on ws://0.0.0.0:{port}", flush=True)
-        await asyncio.Future()
+        cleanup = asyncio.create_task(prune_history_periodically())
+        try:
+            await asyncio.Future()
+        finally:
+            cleanup.cancel()
+            await asyncio.gather(cleanup, return_exceptions=True)
 
 
 def main() -> None:
