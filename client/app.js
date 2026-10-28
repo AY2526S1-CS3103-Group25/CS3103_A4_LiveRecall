@@ -1,16 +1,17 @@
 /*
- * LiveRecall browser client: live revision display (issue #3).
+ * LiveRecall browser client: live revision display (issue #3) and
+ * automatic reconnect with visible connection state (issue #4).
  *
  * Implemented behavior:
  *   - opens a WebSocket
- *   - sends CLIENT_HELLO
+ *   - sends CLIENT_HELLO, resuming from the latest finalized caption held locally
  *   - replaces accepted revisions in the same caption row
  *   - distinguishes provisional/final captions and protects finalized text
  *   - removes expired finals and abandoned provisional rows
+ *   - reconnects automatically with backoff and reports connection state
  *
  * Graded TODOs:
  *   - implement 30 s default recall + 15/30/60 s views
- *   - automatic reconnect + correct resume state
  *   - HISTORY merge/deduplication
  *   - usable final UI
  */
@@ -19,6 +20,10 @@ const WS_URL = "ws://127.0.0.1:8765";
 // Keep 60 seconds of finals plus a small margin; check expiry even when idle.
 const CAPTION_RETENTION_MS = 70_000;
 const CLEANUP_INTERVAL_MS = 5_000;
+// Reconnect backoff: double the wait each failed attempt, capped, so a server
+// that is still down is not hammered; a successful open resets the counter.
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 10000;
 const statusEl = document.getElementById("status");
 const liveEl = document.getElementById("live");
 const liveEmptyEl = document.getElementById("live-empty");
@@ -31,8 +36,16 @@ const captionsBySegment = new Map();
 const prunedSegments = new Map();
 // Used only for cleanup: older provisionals may be abandoned as the stream moves on.
 let latestSegment = 0;
+// Resume state for CLIENT_HELLO: the latest FINALIZED caption this client holds.
+// Updated only where captions are accepted (acceptCaptionUpdate), so it always
+// reflects what this client actually keeps, never a provisional it glimpsed.
+let latestFinal = { segment: 0, revision: 0 };
 
 let ws;
+// Reconnect bookkeeping. The timer is cleared before each new dial so a
+// stale schedule can never open a duplicate connection.
+let reconnectAttempts = 0;
+let reconnectTimer = null;
 
 function numericClientId() {
   const key = "liverecall-client-id";
@@ -99,6 +112,11 @@ function acceptCaptionUpdate(msg) {
   // A late final or newer revision can restore a pruned provisional caption.
   prunedSegments.delete(msg.segment);
   latestSegment = Math.max(latestSegment, msg.segment);
+  // Resume state follows finalized captions only, and never regresses, so a
+  // late or duplicate final cannot push the reported resume point backwards.
+  if (msg.final && msg.segment > latestFinal.segment) {
+    latestFinal = { segment: msg.segment, revision: msg.revision };
+  }
   updateEmptyState();
   liveEl.scrollTop = liveEl.scrollHeight;
 }
@@ -129,23 +147,35 @@ function pruneExpiredCaptions() {
   updateEmptyState();
 }
 
-function connect() {
-  statusEl.textContent = "connecting";
-  ws = new WebSocket(WS_URL);
+function setStatus(text, connected = false) {
+  statusEl.textContent = text;
+  statusEl.style.color = connected ? "green" : "tomato";
+}
 
-  ws.addEventListener("open", () => {
-    statusEl.textContent = "connected";
-    ws.send(JSON.stringify({
+function connect() {
+  // A previous schedule must not fire after we have already dialed again.
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  setStatus("connecting");
+  const socket = new WebSocket(WS_URL);
+  ws = socket;
+
+  socket.addEventListener("open", () => {
+    reconnectAttempts = 0;
+    setStatus("connected", true);
+    socket.send(JSON.stringify({
       type: "CLIENT_HELLO",
       client_id: numericClientId(),
       session: "L1",
-      last_segment: 0,       // TODO (#4): resume from the latest final held locally.
-      last_revision: 0,
+      last_segment: latestFinal.segment,
+      last_revision: latestFinal.revision,
       history_seconds: 30
     }));
   });
 
-  ws.addEventListener("message", (event) => {
+  socket.addEventListener("message", (event) => {
     let msg;
     try {
       msg = JSON.parse(event.data);
@@ -154,6 +184,9 @@ function connect() {
     }
     if (msg === null || typeof msg !== "object" || Array.isArray(msg)) return;
     if (msg.type === "CAPTION_UPDATE") {
+      // No socket-identity guard here on purpose: a caption that arrives just
+      // as a socket dies is still valid stream data, and the revision checks
+      // in acceptCaptionUpdate already reject stale/duplicate state.
       acceptCaptionUpdate(msg);
     } else if (msg.type === "HISTORY") {
       console.log(`HISTORY with ${msg.items?.length ?? 0} item(s)`, msg);
@@ -161,13 +194,20 @@ function connect() {
     }
   });
 
-  ws.addEventListener("close", () => {
-    statusEl.textContent = "disconnected";
-    // TODO: automatic reconnect after a short delay, using finalized resume state.
+  socket.addEventListener("close", () => {
+    // A late close from a socket that has already been replaced must not
+    // reschedule a second, duplicate reconnection.
+    if (socket !== ws) return;
+    const attempt = ++reconnectAttempts;
+    setStatus(`disconnected - reconnecting (attempt ${attempt})`);
+    const delay = Math.min(RECONNECT_BASE_MS * 2 ** (attempt - 1), RECONNECT_MAX_MS);
+    reconnectTimer = setTimeout(connect, delay);
   });
 
-  ws.addEventListener("error", () => {
-    statusEl.textContent = "connection error";
+  socket.addEventListener("error", () => {
+    // Browsers always deliver a close event after an error, and the close
+    // handler owns the reconnect schedule; this only reflects the state.
+    if (socket === ws) setStatus("connection error");
   });
 }
 
