@@ -73,8 +73,22 @@ Caption source -> caption server -> browser display
 1. Each segment appears as **PROVISIONAL**, using muted italic text.
 2. Newer revisions replace the text on the same line without adding duplicates.
 3. The completed segment becomes **FINAL**, using darker normal text.
-4. Both tabs should finish with exactly **five FINAL lines** and no browser
-   console errors.
+4. Immediately after the source finishes, both tabs should show exactly
+   **five FINAL lines** and no browser console errors. Check before the live
+   window expires.
+
+The live pane scrolls internally (up to `min(24rem, 50vh)`, with its existing
+6rem minimum height), keeping the newest accepted update visible while recall
+buttons remain outside the pane. It is keyboard-focusable and labeled
+**Live captions**; long caption text wraps. Initially, a separate status reads
+**Waiting for captions.** Once accepted captions have all expired, it reads
+**No recent captions. Older captions have left the live window.** The status
+is hidden whenever caption rows exist.
+
+Malformed JSON and non-object messages are ignored. Caption updates require
+positive safe integers for `segment` and `revision` and a boolean `final`;
+invalid updates are ignored before changing state. Unknown fields are ignored,
+and caption text is rendered as plain text.
 
 Caption rows stay in segment order, including captions restored by late updates.
 The display ignores older revisions and repeated provisional updates. A final
@@ -83,12 +97,19 @@ captions remain protected from later updates. Finalized captions remain visible
 for about 70 seconds, then their rows and stored state are removed. Older
 provisional captions are also removed if they receive no accepted updates for
 70 seconds and the stream has moved to a later segment. The newest active
-caption is preserved, and a late final or newer revision can restore a removed
-provisional caption. Only the revision and final status of removed captions are
-temporarily remembered to reject stale updates; these records also expire after
-about 70 seconds. This guard does not implement reconnect recovery or history
+caption's text is preserved indefinitely. After 70 seconds without an accepted
+update, it shows **PROVISIONAL — STALE** with an explanation that no recent
+updates have arrived. The existing five-second cleanup timer detects this at
+about 70–75 seconds. An accepted newer revision or final clears the stale label;
+rejected updates do not refresh the timer. A late final or newer revision can
+restore a removed provisional caption. Only the revision and final status of
+removed captions are temporarily remembered to reject stale updates; these
+records also expire after about 70 seconds. This guard does not implement
+reconnect recovery or history
 merging; the reconnect follow-up must send the actual latest finalized segment
 and revision in `CLIENT_HELLO`.
+
+Run the client state regressions (Node.js required) with `node --test tests/client.test.cjs`.
 
 To repeat the test, reload both tabs, wait for **connected**, then run the
 Terminal 3 command again. Reloading clears the previous captions. Press

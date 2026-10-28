@@ -21,6 +21,7 @@ const CAPTION_RETENTION_MS = 70_000;
 const CLEANUP_INTERVAL_MS = 5_000;
 const statusEl = document.getElementById("status");
 const liveEl = document.getElementById("live");
+const liveEmptyEl = document.getElementById("live-empty");
 const recallEl = document.getElementById("recall");
 
 // One accepted caption and DOM row per segment in the single L1 session.
@@ -43,14 +44,29 @@ function numericClientId() {
   return Number(value);
 }
 
-function renderCaption(row, msg) {
-  const state = msg.final ? "FINAL" : "PROVISIONAL";
+function renderCaption(row, msg, stale = false) {
+  const state = msg.final ? "FINAL" : stale ? "PROVISIONAL — STALE" : "PROVISIONAL";
   row.className = `caption-line ${msg.final ? "caption-final" : "caption-provisional"}`;
   // Treat source text as text, never as HTML.
-  row.textContent = `[${state}] segment ${msg.segment} rev ${msg.revision}: ${msg.text}`;
+  row.textContent = `[${state}] segment ${msg.segment} rev ${msg.revision}: ${msg.text}` +
+    (stale ? " (No recent updates have arrived.)" : "");
+}
+
+function updateEmptyState() {
+  liveEmptyEl.hidden = captionsBySegment.size > 0;
+  const message = latestSegment === 0
+    ? "Waiting for captions."
+    : "No recent captions. Older captions have left the live window.";
+  // Avoid repeating the same status announcement on every cleanup tick.
+  if (liveEmptyEl.textContent !== message) liveEmptyEl.textContent = message;
 }
 
 function acceptCaptionUpdate(msg) {
+  // Validate before comparisons or state changes; extra fields are ignored.
+  if (!Number.isSafeInteger(msg.segment) || msg.segment <= 0 ||
+      !Number.isSafeInteger(msg.revision) || msg.revision <= 0 ||
+      typeof msg.final !== "boolean") return;
+
   const current = captionsBySegment.get(msg.segment);
   const previous = current ? current.caption : prunedSegments.get(msg.segment);
 
@@ -76,12 +92,14 @@ function acceptCaptionUpdate(msg) {
   captionsBySegment.set(msg.segment, {
     caption: msg,
     row,
+    stale: false,
     // Only accepted updates refresh the clock; finals get their full local window.
     lastUpdatedAt: performance.now()
   });
   // A late final or newer revision can restore a pruned provisional caption.
   prunedSegments.delete(msg.segment);
   latestSegment = Math.max(latestSegment, msg.segment);
+  updateEmptyState();
   liveEl.scrollTop = liveEl.scrollHeight;
 }
 
@@ -102,8 +120,13 @@ function pruneExpiredCaptions() {
         final: entry.caption.final,
         expiresAt: now + CAPTION_RETENTION_MS
       });
+    } else if (!canExpire && entry.lastUpdatedAt <= cutoff && !entry.stale) {
+      // Keep the newest unfinished text, but make its inactivity visible.
+      entry.stale = true;
+      renderCaption(entry.row, entry.caption, true);
     }
   }
+  updateEmptyState();
 }
 
 function connect() {
@@ -123,7 +146,13 @@ function connect() {
   });
 
   ws.addEventListener("message", (event) => {
-    const msg = JSON.parse(event.data);
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    if (msg === null || typeof msg !== "object" || Array.isArray(msg)) return;
     if (msg.type === "CAPTION_UPDATE") {
       acceptCaptionUpdate(msg);
     } else if (msg.type === "HISTORY") {
