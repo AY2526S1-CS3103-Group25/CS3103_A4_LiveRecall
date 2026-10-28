@@ -2,21 +2,51 @@
 
 ## How AI was used
 
-### Issue #3 - live caption display
+### Server protocol ingestion (issue #1)
+
+- **Claude Code (Anthropic, Fable 5 model)** — interactive CLI agent used to plan and implement the server-side protocol ingestion (issue #1 / PR #20): the `CaptionUpdate` validation layer in `solution_server.py`, ad-hoc protocol probe scripts used during testing, and the PR/issue write-ups. All generated code was reviewed by the team and verified against the public test harness before merging.
+- **Claude Code automated PR review (GitHub Actions, `claude-sonnet-5-5`)** — the workflow in `.github/workflows/` reviews every PR and leaves inline comments; its findings on PR #20 were triaged by the team and either applied or argued against in the review threads.
+
+### Live caption display (issue #3)
 
 AI was used as an implementation and review aid to discuss design options,
 draft parts of the caption display logic, and identify edge cases. Proposed
 changes were evaluated against the assignment's revision rules, bounded-state
 requirements, and need for simple, understandable code.
 
-## One useful suggestion
+## Useful suggestions
+
+### Preserving server updates with recoverable field errors
+
+The automated reviewer flagged that our first ingestion implementation dropped any `CAPTION_UPDATE` failing strict validation — including a `final=true` update with a missing or non-numeric `source_ts`, and later the same problem for a missing or non-string `text`. Since a dropped final can never be recovered (the protocol has no retransmit, and Final Caption Completeness counts unique finals delivered), one malformed field would have permanently cost score in the graded tests.
+
+We split the fields by what a wrong guess costs. An invalid `source_ts` is replaced with the server's receive time (commit `9ed84a2`) and an invalid `text` with an empty string (commit `3430a12`), in both cases patching the value into the forwarded payload so clients still parse it. The identity fields `segment`, `revision` and `final` stay strict, because a guessed value there would place the caption at the wrong position in the stream or deduplicate it against the wrong segment — corrupting session state, which is worse than dropping one frame. The assignment does not require these replacements: they keep an update from being dropped, but they cannot restore its original timestamp or its missing text.
+
+**Verification:** a probe script sent updates with missing and `null` `source_ts`, a final with `text: 42`, plus a battery of genuinely malformed frames; the client received the defaulted updates (extra fields intact, the untouched field unchanged) while malformed frames were still dropped, and `run_demo.py --clients 20 --duration 20` reported 100% final-caption completeness with 0 duplicates/stale messages.
+
+### Replacing caption revisions in one row
 
 Keeping one caption row per segment was a useful suggestion because it allows
 newer revisions to replace existing text without duplicate lines. The approach
 was adopted with explicit checks for older revisions and finalized captions.
 Browser checks verified these behaviors.
 
-## One suggestion that required modification
+## Suggestions that required modification
+
+### Server session validation
+
+The AI's initial implementation added a per-update session check: any `CAPTION_UPDATE` whose `session` field differed from the `SOURCE_HELLO` session was dropped:
+
+```python
+elif isinstance(msg_session, str) and msg_session != session:
+    reason = f"session {msg_session!r} does not match {session!r}"
+```
+
+**Problem:** the spec (Section 4.1) lists `session` among the `CAPTION_UPDATE` fields, but assigns it no meaning beyond identifying the lecture in `SOURCE_HELLO`. So the check was neither required nor forbidden by the assignment — removing it was our risk judgement, not the correction of a rules violation. The objection is that the comparison conveys no information while carrying a total failure mode: one source connection already *is* one session, so a matching `session` confirms nothing the connection had not already established, but if the hidden test source ever tagged its updates with a value differing from its hello, every caption — finals included — would be silently dropped and Final Caption Completeness would go to 0.
+
+**Correction:** removed the check entirely (commit `0f19fa5`); the session is identified by the connection's `SOURCE_HELLO`, and the update's own `session` field is now read by nothing and forwarded unmodified in the raw payload. Verified by probe (an update tagged `session: "L2"` after an `"L1"` hello is now forwarded) and a clean T1 run.
+
+### Bounded client state and revision protection
 
 The initial AI-assisted design kept every caption for the page session. Review
 identified that this would allow memory usage to grow throughout a lecture.
@@ -37,46 +67,24 @@ display order. Reconnect recovery remains separate work.
 
 ## Issue #3 — evaluating caption reliability and usability
 
-During review with AI, I examined cases where the display could look correct
-while giving the viewer misleading information. I evaluated the suggested fixes
-against caption preservation, revision correctness, and the existing live window.
+During review with AI, I found that an abandoned provisional caption could look
+current indefinitely. The suggestion was to delete it, but I questioned whether
+that would remove useful context. I chose to preserve the newest unfinished text
+and mark it "PROVISIONAL — STALE" after 70 seconds without an accepted update.
+Rejected revisions do not reset the timer; an accepted newer revision or final
+clears the label. The existing five-second cleanup timer detects staleness at
+about 70–75 seconds. Finals and older provisionals still expire after roughly
+70 seconds, with revision/finality guards retained for one extra 70-second
+window, so duplicate protection remains temporary.
 
-- **An unfinished caption could appear current indefinitely.** The review
-  suggested expiring it, but that would remove the viewer's last available
-  context. I chose to preserve the newest provisional text and label it
-  "PROVISIONAL — STALE" after 70 seconds without an accepted update. I also
-  distinguished receiving a message from accepting useful progress: rejected
-  revisions must not refresh the timer or clear the label. An accepted newer
-  revision or final clears it. Reusing the five-second cleanup timer gives
-  detection at about 70–75 seconds without another timer.
-- **The existing auto-scroll did not constrain the growing pane.** I traced
-  this to the lack of a height limit and scrollable overflow. I adopted an
-  internal scroll area capped at `min(24rem, 50vh)`, keeping the 6rem minimum
-  height, wrapping, and recall controls outside it. Keyboard focus and a
-  "Live captions" label make the pane accessible beyond mouse scrolling.
-- **Revision comparisons assumed valid input.** I considered how a missing
-  revision or a string such as `"false"` could undermine those comparisons.
-  I added validation before state changes: positive safe integers for segment
-  and revision, and a boolean final flag. Malformed JSON and non-object messages
-  are ignored; unknown fields remain allowed for protocol compatibility, and
-  caption text still renders as plain text.
-- **An empty pane did not explain what had happened.** I separated initial
-  waiting from expiry with two status messages. I placed the status outside
-  the caption container to preserve segment ordering and avoided rewriting
-  unchanged status text on every cleanup tick to prevent repeated announcements.
-
-I kept finals and superseded provisionals on the existing roughly 70-second
-retention window, with pruned revision/finality guards for one extra 70-second
-window. Only the newest provisional text is preserved indefinitely; duplicate
-protection remains temporary. Lecture restarts, reconnect, history/recall, and
-multi-session behavior remain separate work, with no server or protocol changes.
-
-Verification used six Node.js regressions running the actual client script with
-a controlled clock, plus Chromium checks of the actual HTML/script with
-intercepted WebSocket messages at desktop and mobile sizes. The UI detector
-reported no findings. The submission sanity check found the required files,
-but its server startup and the real two-browser demo could not be verified in
-this sandbox because binding the server port was denied.
+I also evaluated AI suggestions for internal scrolling, input validation, and
+empty-state messages. I adopted them while keeping recall controls outside the
+scrolling pane, validating updates before state changes, allowing unknown fields,
+and placing the empty status outside the caption rows to preserve their order.
+Six controlled-clock regressions and desktop/mobile Chromium checks with mocked
+WebSocket messages passed, and the UI detector reported no findings. The real
+server demo and submission startup check remained unverified because the sandbox
+blocked port binding.
 
 ## Responsibility statement
 
