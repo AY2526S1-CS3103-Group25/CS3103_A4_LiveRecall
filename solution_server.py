@@ -131,57 +131,44 @@ class SessionState:
         Synchronous on purpose: the check-and-set must not be interrupted by an
         await, so concurrent ingests on the event loop cannot double-accept.
 
-        Never delivers anything for an already-finalized segment, and never
-        delivers a provisional at a revision <= the stored one. A final at
-        exactly the stored provisional revision IS delivered (once): finals
-        must reach every client, and a source may legally promote the last
-        provisional in place. A final at a lower revision stays rejected —
-        finalizing on it would durably bind the segment to older text than
-        clients already displayed.
+        Reject ladder, top to bottom:
+        - closed segment (<= watermark): dead, except the single late final
+          of a force-closed, never-finalized segment (`_reopenable`);
+        - already-final segment: finals are durable, nothing may follow;
+        - lower revision: stale, even if marked final — finalizing on it
+          would durably bind the segment to older text than clients already
+          displayed;
+        - same revision, provisional: duplicate.
+        Everything else is stored and delivered: a first-seen segment, a
+        strictly newer revision, or a final at exactly the stored provisional
+        revision — a source may legally promote the last provisional in
+        place, so that final is delivered (once) and the segment closes.
         """
-        if update.segment <= self._closed_up_to:
-            return self._apply_to_closed(update)
-        stored = self._segments.get(update.segment)
-        if stored is not None:
-            return self._apply_to_tracked(update, *stored)
-        self._track(update)
-        return True
-
-    def _apply_to_closed(self, update: CaptionUpdate) -> bool:
-        # The late final of a force-closed, never-finalized segment is
-        # delivered exactly once; everything else below the watermark is dead.
-        if update.final and update.segment in self._reopenable:
-            self._reopenable.discard(update.segment)
-            return True
-        self._dropped_post_final += 1
-        return False
-
-    def _apply_to_tracked(
-        self, update: CaptionUpdate, revision: int, final: bool
-    ) -> bool:
-        if final:
+        seg = update.segment
+        if seg <= self._closed_up_to:
+            if update.final and seg in self._reopenable:
+                self._reopenable.discard(seg)
+                return True
             self._dropped_post_final += 1
             return False
-        if update.revision == revision:
-            if update.final:
-                # Promote-in-place: the final reuses the provisional's
-                # revision number; deliver it once and close the segment.
-                self._track(update)
-                return True
-            self._dropped_duplicate += 1
-            return False
-        if update.revision < revision:
-            self._dropped_stale += 1
-            return False
-        self._track(update)
-        return True
-
-    def _track(self, update: CaptionUpdate) -> None:
-        self._segments[update.segment] = (update.revision, update.final)
+        stored = self._segments.get(seg)
+        if stored is not None:
+            revision, final = stored
+            if final:
+                self._dropped_post_final += 1
+                return False
+            if update.revision < revision:
+                self._dropped_stale += 1
+                return False
+            if update.revision == revision and not update.final:
+                self._dropped_duplicate += 1
+                return False
+        self._segments[seg] = (update.revision, update.final)
         if update.final:
             self._compact()
         if len(self._segments) > self.MAX_TRACKED_SEGMENTS:
             self._force_close_oldest()
+        return True
 
     def _compact(self) -> None:
         # Advance the watermark over the contiguous finalized prefix and drop
