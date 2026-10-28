@@ -63,7 +63,12 @@ class SessionState:
     across a mid-stream source disconnect/reconnect so replayed frames stay
     deduplicated, but resets when a new source connects after the previous
     stream completed with SOURCE_DONE (a fresh lecture restarting at
-    segment 1 must be deliverable without a server restart).
+    segment 1 must be deliverable without a server restart). SOURCE_DONE is
+    not guaranteed — a source killed mid-stream never sends it — so there is
+    a fallback: a provisional segment-1 revision-1 frame arriving after
+    segment 1 has closed also resets, since a conforming source numbers
+    segments monotonically from 1 and such a frame can only start a new
+    stream (see apply()).
 
     Memory: the contiguous finalized prefix is compacted to the
     `closed_up_to` watermark and pruned from `segments`; durability for
@@ -113,7 +118,9 @@ class SessionState:
         A new SOURCE_HELLO after a SOURCE_DONE is a new lecture whose segments
         restart at 1 — without a reset every frame would be rejected as
         post-final. A reconnect WITHOUT a prior SOURCE_DONE (crash, network
-        drop) keeps state, so frames the source replays stay deduplicated.
+        drop) keeps state, so frames the source replays stay deduplicated; if
+        that connection turns out to be a new stream instead of a replaying
+        one, the segment-1 fallback in apply() catches it.
         """
         if self._done:
             print(
@@ -131,6 +138,18 @@ class SessionState:
         Synchronous on purpose: the check-and-set must not be interrupted by an
         await, so concurrent ingests on the event loop cannot double-accept.
 
+        New-stream fallback (before the ladder): a provisional segment-1
+        revision-1 frame after segment 1 has closed resets the session. A
+        conforming source numbers segments monotonically from 1, so within
+        one stream that frame cannot reappear once segment 1 closed; it can
+        only begin a new stream whose predecessor was killed before sending
+        SOURCE_DONE (e.g. Ctrl-C, then rerun against the same server).
+        Without the reset the whole new lecture would be silently dropped as
+        post-final. Deliberately narrow: a FINAL s1r1 never triggers it (so a
+        replayed reopenable late final can't wipe live state), and a
+        reopenable segment 1 is excluded (its late final must stay
+        deliverable).
+
         Reject ladder, top to bottom:
         - closed segment (<= watermark): dead, except the single late final
           of a force-closed, never-finalized segment (`_reopenable`);
@@ -145,6 +164,19 @@ class SessionState:
         place, so that final is delivered (once) and the segment closes.
         """
         seg = update.segment
+        if (
+            seg == 1
+            and update.revision == 1
+            and not update.final
+            and self._closed_up_to >= 1
+            and 1 not in self._reopenable
+        ):
+            print(
+                "segment 1 revision 1 after segment 1 closed: treating as a "
+                f"new stream, resetting ({self.drop_summary()})",
+                flush=True,
+            )
+            self.__init__()
         if seg <= self._closed_up_to:
             if update.final and seg in self._reopenable:
                 self._reopenable.discard(seg)
