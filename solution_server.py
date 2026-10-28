@@ -61,6 +61,24 @@ def _is_positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
+def _finite_float(value: Any) -> float | None:
+    """Coerce a JSON number to a finite float, or None if it is not one.
+
+    JSON integers have arbitrary precision, so the conversion to a C double
+    can itself overflow (`float(10 ** 400)` raises OverflowError, and so does
+    `math.isfinite` on the same value). The guard keeps an absurd timestamp a
+    dropped field rather than an exception that would kill the connection.
+    """
+    # bool is a subclass of int, so it must be rejected explicitly.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
 def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
     """Validate a decoded CAPTION_UPDATE; return None (and log) if malformed.
 
@@ -93,13 +111,9 @@ def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
         print(f"dropping malformed CAPTION_UPDATE: {reason}", flush=True)
         return None
 
-    source_ts = msg.get("source_ts")
+    source_ts = _finite_float(msg.get("source_ts"))
     patched: dict[str, Any] = {}
-    if (
-        isinstance(source_ts, bool)
-        or not isinstance(source_ts, (int, float))
-        or not math.isfinite(source_ts)
-    ):
+    if source_ts is None:
         source_ts = time.time()
         patched["source_ts"] = source_ts
     if not isinstance(text, str):
@@ -118,7 +132,7 @@ def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
     return CaptionUpdate(
         segment=segment,
         revision=revision,
-        source_ts=float(source_ts),
+        source_ts=source_ts,
         final=final,
         text=text,
         payload=payload,
@@ -165,7 +179,10 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
         async for raw in ws:
             try:
                 msg = json.loads(raw)
-            except json.JSONDecodeError:
+            except ValueError:
+                # JSONDecodeError for malformed JSON, UnicodeDecodeError if the
+                # frame arrived as binary with invalid UTF-8. Both subclass
+                # ValueError; neither should drop the source connection.
                 continue
             if not isinstance(msg, dict):
                 continue
@@ -212,7 +229,9 @@ async def handler(ws) -> None:
     try:
         raw = await asyncio.wait_for(ws.recv(), timeout=5)
         hello = json.loads(raw)
-    except (asyncio.TimeoutError, json.JSONDecodeError):
+    except (asyncio.TimeoutError, ValueError):
+        # ValueError covers JSONDecodeError and UnicodeDecodeError (a binary
+        # hello frame with invalid UTF-8).
         await ws.close(code=1008, reason="Expected a valid hello message")
         return
     if not isinstance(hello, dict):
