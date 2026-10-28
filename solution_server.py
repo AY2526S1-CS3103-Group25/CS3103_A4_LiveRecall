@@ -79,6 +79,25 @@ def _finite_float(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _decode_source_frame(raw: str | bytes) -> tuple[Any, str | bytes]:
+    """Decode a source frame into (message, payload to forward).
+
+    `json.loads` accepts the JavaScript-only `NaN`/`Infinity`/`-Infinity`
+    literals and `json.dumps` re-emits them, but they are not valid JSON:
+    a browser's `JSON.parse` rejects the entire frame, so a caption carrying
+    one in any field — including an unknown extra one we never look at —
+    would be lost. When such a literal is seen it is replaced with null and
+    the payload re-serialized. `parse_constant` fires only in that case, so
+    ordinary frames keep their byte-exact payload and pay nothing.
+    """
+    seen: list[str] = []
+    msg = json.loads(raw, parse_constant=lambda name: seen.append(name) or None)
+    if not seen:
+        return msg, raw
+    print(f"rewrote non-JSON literal(s) to null: {', '.join(seen)}", flush=True)
+    return msg, json.dumps(msg)
+
+
 def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
     """Validate a decoded CAPTION_UPDATE; return None (and log) if malformed.
 
@@ -178,7 +197,7 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
     try:
         async for raw in ws:
             try:
-                msg = json.loads(raw)
+                msg, raw = _decode_source_frame(raw)
             except ValueError:
                 # JSONDecodeError for malformed JSON, UnicodeDecodeError if the
                 # frame arrived as binary with invalid UTF-8. Both subclass
