@@ -235,20 +235,20 @@ class SessionState:
     def history_items(
         self, last_segment: int, last_revision: int, history_seconds: float
     ) -> list[dict[str, Any]]:
-        """Snapshot missed finals in segment order, within source event time.
+        """Snapshot missed finals in segment order, within receipt time.
 
         The cursor reports the latest finalized state held by the client.
-        Monotonic receipt time bounds storage even for future source timestamps;
-        source_ts selects the requested recent lecture context without changing
-        the original event timestamps or extra fields.
+        Use the same monotonic receipt clock for retention and selection: source
+        and server wall clocks need not agree. Original timestamps and extra
+        fields remain unchanged in the response.
         """
         self.prune_history()
         if history_seconds <= 0:
             return []
-        cutoff = time.time() - history_seconds
+        cutoff = time.monotonic() - history_seconds
         updates = [
-            update for _, update in self._history
-            if update.source_ts >= cutoff
+            update for received_at, update in self._history
+            if received_at >= cutoff
             and (update.segment, update.revision) > (last_segment, last_revision)
         ]
         return [json.loads(update.payload) for update in sorted(

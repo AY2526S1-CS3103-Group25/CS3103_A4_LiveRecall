@@ -48,17 +48,28 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
 
     def test_requested_windows_include_exact_cutoff(self):
         for segment, age in enumerate([61, 60, 30, 15, 0], start=1):
+            self.clock.return_value = 100 - age
             self.state.apply(caption(segment, source_ts=1000 - age))
+        self.clock.return_value = 100
         for seconds, expected in [(0, []), (15, [4, 5]), (30, [3, 4, 5]),
                                   (60, [2, 3, 4, 5])]:
             with self.subTest(seconds=seconds):
                 self.assertEqual([m["segment"] for m in self.items(seconds=seconds)],
                                  expected)
 
+    def test_source_clock_skew_does_not_hide_recent_finals(self):
+        for segment, timestamp in enumerate([939, 1061, 10**10], start=1):
+            self.state.apply(caption(segment, source_ts=timestamp))
+        self.wall.return_value = 10**11
+        self.assertEqual([m["segment"] for m in self.items()], [1, 2, 3])
+        self.assertEqual([m["source_ts"] for m in self.items()],
+                         [939, 1061, 10**10])
+
     def test_storage_expiry_does_not_remove_duplicate_protection(self):
         self.state.apply(caption(1))
         self.clock.return_value = 169.9
-        self.assertEqual(len(self.items()), 1)
+        self.assertEqual(self.items(), [])  # retained beyond the request window
+        self.assertEqual(len(self.state._history), 1)
         self.clock.return_value = 170
         self.state.prune_history()
         self.assertEqual(self.items(), [])
@@ -172,7 +183,9 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(client, server.CLIENTS)
 
     async def test_hello_clamps_windows_and_defaults_invalid_fields(self):
-        await server.ingest_caption_update(caption(1, source_ts=955))
+        with patch.object(server.time, "monotonic",
+                          return_value=server.time.monotonic() - 45):
+            await server.ingest_caption_update(caption(1, source_ts=955))
         for hello, expected in [({}, []), ({"history_seconds": 100}, [1]),
                                 ({"history_seconds": -1}, []),
                                 ({"history_seconds": None}, []),

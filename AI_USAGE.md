@@ -25,7 +25,7 @@ We split the fields by what a wrong guess costs. An invalid `source_ts` is repla
 
 **Verification:** a probe script sent updates with missing and `null` `source_ts`, a final with `text: 42`, plus a battery of genuinely malformed frames; the client received the defaulted updates (extra fields intact, the untouched field unchanged) while malformed frames were still dropped, and `run_demo.py --clients 20 --duration 20` reported 100% final-caption completeness with 0 duplicates/stale messages.
 
-Codex suggested keeping recent finalized payloads separate from the revision-state watermark. This preserves recoverable text when revision metadata is compacted. The server retains 70 seconds of finals using monotonic receipt time for storage expiry and original `source_ts` for requested context. We avoided a fixed count cap that could discard required finals inside the 60-second recovery window.
+Codex suggested keeping recent finalized payloads separate from the revision-state watermark. This preserves recoverable text when revision metadata is compacted. The server retains 70 seconds of finals using monotonic receipt time for both storage expiry and requested context; original `source_ts` values remain unmodified for caption-age measurements. We avoided a fixed count cap that could discard required finals inside the 60-second recovery window.
 
 **Verification:** all 13 history regressions and the startup check passed on macOS. Three independent runs each of T1 and T4 achieved 100% final completeness with zero duplicate/stale messages; each T4 run recovered 120 missed finals. Raw CSV/JSON outputs remain locally under `results/issue6/`. Ubuntu performance validation remains outstanding.
 
@@ -95,6 +95,8 @@ Six controlled-clock regressions and desktop/mobile Chromium checks with mocked
 WebSocket messages passed, and the UI detector reported no findings. The real
 server demo and submission startup check remained unverified because the sandbox
 blocked port binding.
+
+Review by LeongWZ exposed a clock-skew assumption in the original HISTORY selection: server wall time was compared with source event time. Codex changed selection to monotonic receipt age and added a regression with past/future source clocks and a server wall-clock jump. All 14 history regressions passed. The oversized HISTORY finding is valid, but dropping oldest finals to fit a frame would sacrifice the required recovery window. Bounded wire batching and its client compatibility need a separate protocol decision; no finals were silently truncated.
 
 ## Responsibility statement
 
