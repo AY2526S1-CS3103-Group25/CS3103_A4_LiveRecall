@@ -1,5 +1,5 @@
 /*
- * LiveRecall browser client: live revision display (issue #3).
+ * LiveRecall browser client: live revision display and local recall.
  *
  * Implemented behavior:
  *   - opens a WebSocket
@@ -7,9 +7,9 @@
  *   - replaces accepted revisions in the same caption row
  *   - distinguishes provisional/final captions and protects finalized text
  *   - removes expired finals and abandoned provisional rows
+ *   - recalls 15/30/60 seconds of locally received finalized captions
  *
  * Graded TODOs:
- *   - implement 30 s default recall + 15/30/60 s views
  *   - automatic reconnect + correct resume state
  *   - HISTORY merge/deduplication
  *   - usable final UI
@@ -23,6 +23,10 @@ const statusEl = document.getElementById("status");
 const liveEl = document.getElementById("live");
 const liveEmptyEl = document.getElementById("live-empty");
 const recallEl = document.getElementById("recall");
+const recallHeadingEl = document.getElementById("recall-heading");
+const recallEmptyEl = document.getElementById("recall-empty");
+const recallButtons = Array.from(document.querySelectorAll("button[data-seconds]"));
+let recallSeconds = 30;
 
 // One accepted caption and DOM row per segment in the single L1 session.
 const captionsBySegment = new Map();
@@ -33,15 +37,23 @@ const prunedSegments = new Map();
 let latestSegment = 0;
 
 let ws;
+let clientId;
 
 function numericClientId() {
+  if (clientId !== undefined) return clientId;
   const key = "liverecall-client-id";
-  let value = sessionStorage.getItem(key);
-  if (!value) {
-    value = String(Math.floor(100000 + Math.random() * 900000));
-    sessionStorage.setItem(key, value);
+  clientId = Math.floor(100000 + Math.random() * 900000);
+  try {
+    const stored = Number(sessionStorage.getItem(key));
+    if (Number.isSafeInteger(stored) && stored > 0) {
+      clientId = stored;
+    } else {
+      sessionStorage.setItem(key, String(clientId));
+    }
+  } catch {
+    // Storage may be blocked. Keep one in-memory ID so hello still succeeds.
   }
-  return Number(value);
+  return clientId;
 }
 
 function renderCaption(row, msg, stale = false) {
@@ -61,6 +73,42 @@ function updateEmptyState() {
   if (liveEmptyEl.textContent !== message) liveEmptyEl.textContent = message;
 }
 
+function renderRecall() {
+  // The user chose client receipt time for recall, not source_ts. An accepted
+  // final's lastUpdatedAt never changes, so duplicates cannot extend its window.
+  const cutoff = performance.now() - recallSeconds * 1000;
+  const finals = Array.from(captionsBySegment.values())
+    .filter(entry => entry.caption.final && entry.lastUpdatedAt >= cutoff)
+    .sort((a, b) => a.caption.segment - b.caption.segment);
+  const fragment = document.createDocumentFragment();
+  for (const entry of finals) {
+    // Separate rows leave the live pane intact; source text stays plain text.
+    const row = document.createElement("div");
+    row.dataset.segment = String(entry.caption.segment);
+    renderCaption(row, entry.caption);
+    fragment.appendChild(row);
+  }
+  const scrollTop = recallEl.scrollTop;
+  // One argument avoids the JavaScript argument limit for large local windows.
+  recallEl.replaceChildren(fragment);
+  recallEl.scrollTop = scrollTop;
+  recallEl.hidden = finals.length === 0;
+  recallEmptyEl.hidden = finals.length > 0;
+  const message = `No finalized captions in the previous ${recallSeconds} seconds.`;
+  if (recallEmptyEl.textContent !== message) recallEmptyEl.textContent = message;
+}
+
+function selectRecallWindow(seconds) {
+  if (![15, 30, 60].includes(seconds)) return;
+  recallSeconds = seconds;
+  recallHeadingEl.textContent = `Previous ${seconds} seconds`;
+  for (const button of recallButtons) {
+    button.setAttribute("aria-pressed", String(Number(button.dataset.seconds) === seconds));
+  }
+  // Filtering is entirely local, including when the socket is disconnected.
+  renderRecall();
+}
+
 function acceptCaptionUpdate(msg) {
   // Validate before comparisons or state changes; extra fields are ignored.
   if (!Number.isSafeInteger(msg.segment) || msg.segment <= 0 ||
@@ -78,8 +126,10 @@ function acceptCaptionUpdate(msg) {
         (msg.revision === previous.revision && !msg.final)) return;
   }
 
+  // Match the server's lenient text policy without coercing arbitrary objects.
+  const caption = typeof msg.text === "string" ? msg : { ...msg, text: "" };
   const row = current ? current.row : document.createElement("div");
-  renderCaption(row, msg);
+  renderCaption(row, caption);
   if (!current) {
     // Late or restored captions belong in segment order, not arrival order.
     row.dataset.segment = String(msg.segment);
@@ -90,7 +140,7 @@ function acceptCaptionUpdate(msg) {
 
   // Reuse the row so accepted revisions replace text without moving the line.
   captionsBySegment.set(msg.segment, {
-    caption: msg,
+    caption,
     row,
     stale: false,
     // Only accepted updates refresh the clock; finals get their full local window.
@@ -101,6 +151,7 @@ function acceptCaptionUpdate(msg) {
   latestSegment = Math.max(latestSegment, msg.segment);
   updateEmptyState();
   liveEl.scrollTop = liveEl.scrollHeight;
+  if (msg.final) renderRecall();
 }
 
 function pruneExpiredCaptions() {
@@ -127,6 +178,8 @@ function pruneExpiredCaptions() {
     }
   }
   updateEmptyState();
+  // Expire the selected recall view even when the source is idle.
+  renderRecall();
 }
 
 function connect() {
@@ -171,12 +224,12 @@ function connect() {
   });
 }
 
-for (const button of document.querySelectorAll("button[data-seconds]")) {
+for (const button of recallButtons) {
   button.addEventListener("click", () => {
-    const seconds = Number(button.dataset.seconds);
-    recallEl.textContent = `TODO: show finalized captions from the previous ${seconds} seconds using local state.`;
+    selectRecallWindow(Number(button.dataset.seconds));
   });
 }
 
+selectRecallWindow(30);
 setInterval(pruneExpiredCaptions, CLEANUP_INTERVAL_MS);
 connect();
