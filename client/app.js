@@ -41,11 +41,15 @@ let latestSegment = 0;
 // We report this contiguous run rather than a high-water mark: the server may
 // skip everything at or below the reported point, so a mark that jumps over a
 // segment we never got would make that segment unreachable.
-// pendingFinals only ever holds segments *above* the run head (gaps), so its
-// size is bounded by the size of any out-of-order delivery window.
+// pendingFinals holds finals parked *above* a gap (the missing segment just
+// past the run head). Live delivery is ordered, so a gap only survives when a
+// final is missed (e.g. during a disconnect) and never refilled; once the gap
+// is older than the local retention window, pruneExpiredCaptions abandons it,
+// so the map and the reported resume point stay bounded.
 const pendingFinals = new Map(); // segment -> revision of held, not-yet-contiguous finals
 let contiguousFinal = { segment: 0, revision: 0 };
 let sawFirstFinal = false;
+let gapSince = 0; // when the missing segment just past the run head was first observed
 
 function recordFinalForResume(segment, revision) {
   if (!sawFirstFinal) {
@@ -65,9 +69,12 @@ function recordFinalForResume(segment, revision) {
       contiguousFinal = { segment: next, revision: pendingFinals.get(next) };
       pendingFinals.delete(next);
     }
+    // The run moved: any remaining gap is a fresh one, so re-age it from now.
+    gapSince = pendingFinals.size === 0 ? 0 : performance.now();
   } else {
     // Gap above the head: hold the final until (if ever) the missing segment
     // arrives; the resume report stays at the run head meanwhile.
+    if (gapSince === 0) gapSince = performance.now();
     pendingFinals.set(segment, revision);
   }
 }
@@ -154,6 +161,20 @@ function acceptCaptionUpdate(msg) {
 function pruneExpiredCaptions() {
   const now = performance.now();
   const cutoff = now - CAPTION_RETENTION_MS;
+  // Abandon an unfilled gap once it is older than the local retention window:
+  // the missing final has left the server's window too, so resume from the
+  // oldest parked final instead of parking every later final forever.
+  if (gapSince !== 0 && now - gapSince > CAPTION_RETENTION_MS) {
+    const oldest = Math.min(...pendingFinals.keys());
+    contiguousFinal = { segment: oldest, revision: pendingFinals.get(oldest) };
+    pendingFinals.delete(oldest);
+    while (pendingFinals.has(contiguousFinal.segment + 1)) {
+      const next = contiguousFinal.segment + 1;
+      contiguousFinal = { segment: next, revision: pendingFinals.get(next) };
+      pendingFinals.delete(next);
+    }
+    gapSince = pendingFinals.size === 0 ? 0 : performance.now();
+  }
   for (const [segment, entry] of prunedSegments) {
     if (entry.expiresAt <= now) prunedSegments.delete(segment);
   }
@@ -220,7 +241,11 @@ function connect() {
       acceptCaptionUpdate(msg);
     } else if (msg.type === "HISTORY") {
       console.log(`HISTORY with ${msg.items?.length ?? 0} item(s)`, msg);
-      // TODO: merge history without stale/duplicate final captions.
+      // TODO(#8): route each item through acceptCaptionUpdate (which calls
+      // recordFinalForResume) so replayed finals render, advance the resume
+      // run over segments missed during a disconnect, and dedupe against
+      // already-held state. Until then, a disconnect gap clears only via the
+      // retention-based abandon in pruneExpiredCaptions.
     }
   });
 
