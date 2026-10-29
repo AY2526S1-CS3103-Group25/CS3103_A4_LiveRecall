@@ -260,6 +260,19 @@ test("reconnect backoff caps at 10 s, jitters, and resets only after a surviving
   assert.match(c.status.textContent, /reconnecting \(attempt 2\)/);
 });
 
+test("failed dials after a surviving open keep escalating instead of resetting", () => {
+  const c = client();
+  c.open();          // a stable connection opens at t=0
+  c.advance(11000);  // it survives past the 10 s threshold
+  c.close();         // earns a reset: attempt 1, dial within 1 s
+  c.advance(1000);   // the retry dials
+  assert.equal(c.sockets.length, 2);
+  // The retry never opened: it must not inherit the previous socket's open
+  // time, or every failed dial would reset the counter and retry at ~1 Hz.
+  c.close();
+  assert.match(c.status.textContent, /reconnecting \(attempt 2\)/);
+});
+
 test("a late close from a replaced socket cannot schedule a duplicate reconnect", () => {
   const c = client();
   c.close(); // socket 1 -> attempt 1, timer at most 1 s away

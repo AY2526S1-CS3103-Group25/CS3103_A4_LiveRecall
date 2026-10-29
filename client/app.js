@@ -256,6 +256,10 @@ function connect() {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
+  // The new socket has not opened yet. Without this reset, a failed dial
+  // after one long-lived connection would see the old open time and reset
+  // the backoff on every cycle while the server stays down.
+  openedAt = -1;
   setStatus("connecting");
   const socket = new WebSocket(WS_URL);
   ws = socket;
