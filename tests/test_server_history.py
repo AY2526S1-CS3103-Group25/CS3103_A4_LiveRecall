@@ -210,6 +210,10 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client.messages, [])
             client.release_history.set()
             await asyncio.wait_for(live, 1)
+            async def delivered():
+                while len(client.messages) < 2:
+                    await asyncio.sleep(0)
+            await asyncio.wait_for(delivered(), 1)
             self.assertEqual([m["type"] for m in client.messages],
                              ["HISTORY", "CAPTION_UPDATE"])
             self.assertEqual([m["segment"] for m in client.messages[0]["items"]], [1])
