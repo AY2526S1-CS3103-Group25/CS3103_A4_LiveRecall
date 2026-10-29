@@ -259,6 +259,23 @@ class SessionState:
             updates, key=lambda update: update.segment
         )]
 
+    @property
+    def final_sequence(self) -> int:
+        return self._final_sequence
+
+    @property
+    def expired_sequence(self) -> int:
+        return self._expired_sequence
+
+    def final_after(self, sequence: int) -> CaptionUpdate | None:
+        """Read the next retained final; callers first check expiry."""
+        if sequence < self._final_sequence:
+            return self._history[sequence - self._expired_sequence][1]
+        return None
+
+    def active_updates(self) -> list[CaptionUpdate]:
+        return [self._active[segment] for segment in sorted(self._active)]
+
     def _compact(self) -> None:
         # Advance the watermark over the contiguous finalized prefix and drop
         # those entries; their durability is now carried by _closed_up_to.
@@ -426,7 +443,7 @@ class ClientState:
         self.generation = SESSION.generation
         # Start at the snapshot/live boundary, not the HELLO cursor: context
         # excluded by history_seconds must not reappear during overload recovery.
-        self.final_cursor = SESSION._final_sequence
+        self.final_cursor = SESSION.final_sequence
         self.sent_active: dict[int, int] = {}
         self.lagging = False
         self.catch_up = False
@@ -437,18 +454,26 @@ class ClientState:
         self.catch_ups = 0
 
     def fail(self, reason: str) -> None:
+        if self.failed.is_set():
+            return
         self.failure_reason = reason
         self.failed.set()
 
     def check_recovery(self) -> None:
         if self.generation is not SESSION.generation:
+            # Old queued frames and cursors belong to the previous lecture.
+            # Reconnecting is explicit; silently rebasing cannot reset the
+            # revision map of a client using the required protocol alone.
             self.fail("Source stream restarted; reconnect")
-        elif self.catch_up and max(self.final_cursor, self.in_flight_sequence) < SESSION._expired_sequence:
+        elif (self.catch_up
+              and max(self.final_cursor, self.in_flight_sequence)
+              < SESSION.expired_sequence):
             self.fail("Final recovery window expired; reconnect")
 
-    def _observe_lag(self) -> None:
+    def _observe_lag(self, drop_segment: int | None = None) -> None:
         now = time.monotonic()
-        if ((self.send_started is not None and now - self.send_started >= self.LAG_SECONDS)
+        if ((self.send_started is not None
+             and now - self.send_started >= self.LAG_SECONDS)
                 or (self.pending and now - self.pending[0][2] >= self.LAG_SECONDS)
                 or len(self.pending) >= self.MAX_PENDING * 3 // 4
                 or self.pending_bytes >= self.MAX_PENDING_BYTES * 3 // 4):
@@ -459,12 +484,14 @@ class ClientState:
             seen = set()
             kept = deque()
             for entry in reversed(self.pending):
-                if entry[0].segment not in seen:
+                if entry[0].segment != drop_segment and entry[0].segment not in seen:
                     seen.add(entry[0].segment)
                     kept.appendleft(entry)
+                else:
+                    self.pending_bytes -= entry[1]
             self.coalesced += len(self.pending) - len(kept)
-            self.pending = kept
-            self.pending_bytes = sum(entry[1] for entry in kept)
+            if len(kept) != len(self.pending):
+                self.pending = kept
 
     def offer(self, update: CaptionUpdate, size: int) -> None:
         self.check_recovery()
@@ -473,16 +500,12 @@ class ClientState:
         if self.catch_up:
             self.ready.set()
             return
-        self._observe_lag()
-        sequence = SESSION._final_sequence if update.final else 0
+        self._observe_lag(drop_segment=update.segment)
+        sequence = SESSION.final_sequence if update.final else 0
         # Compact with the incoming frame before enforcing the hard bound.
         # The temporary entry is local and never becomes an unbounded backlog.
-        if self.lagging:
-            retained = deque(entry for entry in self.pending if entry[0].segment != update.segment)
-            self.coalesced += len(self.pending) - len(retained)
-            self.pending = retained
-            self.pending_bytes = sum(entry[1] for entry in retained)
-        if len(self.pending) >= self.MAX_PENDING or self.pending_bytes + size > self.MAX_PENDING_BYTES:
+        if (len(self.pending) >= self.MAX_PENDING
+                or self.pending_bytes + size > self.MAX_PENDING_BYTES):
             self.pending.clear()
             self.pending_bytes = 0
             self.catch_up = self.lagging = True
@@ -497,14 +520,13 @@ class ClientState:
         self.check_recovery()
         if self.failed.is_set():
             return None
-        if self.final_cursor < SESSION._final_sequence:
+        update = SESSION.final_after(self.final_cursor)
+        if update is not None:
             # Recover one final at a time; no private replay copy or full-lecture
             # transcript. The in-flight final advances the cursor only on success.
-            index = self.final_cursor - SESSION._expired_sequence
-            return SESSION._history[index][1], self.final_cursor + 1
-        for segment in sorted(SESSION._active):
-            update = SESSION._active[segment]
-            if self.sent_active.get(segment, 0) < update.revision:
+            return update, self.final_cursor + 1
+        for update in SESSION.active_updates():
+            if self.sent_active.get(update.segment, 0) < update.revision:
                 return update, 0
         self.catch_up = False
         if self.last_send_seconds < self.RECOVER_SECONDS:
@@ -545,14 +567,18 @@ class ClientState:
                 self.sent_active.pop(update.segment, None)
             else:
                 self.sent_active[update.segment] = update.revision
-                if len(self.sent_active) > SESSION.MAX_TRACKED_SEGMENTS:
-                    self.sent_active = {s: r for s, r in self.sent_active.items() if s in SESSION._active}
+                if len(self.sent_active) > SessionState.MAX_TRACKED_SEGMENTS:
+                    active = {update.segment for update in SESSION.active_updates()}
+                    self.sent_active = {
+                        s: r for s, r in self.sent_active.items() if s in active
+                    }
             # Hysteresis: resume full coverage only with little fresh queued work
             # and a fast completed send. Keep a single stalled send per client.
             if (not self.catch_up and len(self.pending) <= self.MAX_PENDING // 4
                     and self.pending_bytes <= self.MAX_PENDING_BYTES // 4
                     and self.last_send_seconds < self.RECOVER_SECONDS
-                    and (not self.pending or time.monotonic() - self.pending[0][2] < self.RECOVER_SECONDS)):
+                    and (not self.pending or time.monotonic() - self.pending[0][2]
+                         < self.RECOVER_SECONDS)):
                 self.lagging = False
             await asyncio.sleep(0)
 
@@ -561,7 +587,8 @@ async def ingest_caption_update(update: CaptionUpdate) -> None:
     """Commit accepted state and offer work without awaiting client I/O."""
     if not SESSION.apply(update):
         return
-    size = len(update.payload.encode("utf-8")) if isinstance(update.payload, str) else len(update.payload)
+    size = (len(update.payload.encode("utf-8"))
+            if isinstance(update.payload, str) else len(update.payload))
     for client in CLIENTS.values():
         client.offer(update, size)
 
@@ -629,7 +656,9 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
     failure = asyncio.create_task(client.failed.wait())
     print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
     try:
-        done, _ = await asyncio.wait((sender, reader, failure), return_when=asyncio.FIRST_COMPLETED)
+        done, _ = await asyncio.wait(
+            (sender, reader, failure), return_when=asyncio.FIRST_COMPLETED
+        )
         for task in done:
             task.result()
     except ConnectionClosed:

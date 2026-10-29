@@ -160,15 +160,23 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         ws = PausedClient()
         client = await self.connect(ws)
         client.MAX_PENDING = 1
-        with patch.object(server.time, 'monotonic', return_value=100):
+        with patch.object(server.time, 'monotonic', return_value=100) as clock:
             await server.ingest_caption_update(caption(1))
+            clock.return_value = 180
             await server.ingest_caption_update(caption(2))
-            server.SESSION._history[0] = (20, server.SESSION._history[0][1])
-            server.SESSION.prune_history()
             client.check_recovery()
         self.assertTrue(client.failed.is_set())
         self.assertIn('expired', client.failure_reason)
         await until(lambda: ws not in server.CLIENTS)
+
+    async def test_failure_reason_preserves_the_first_cause(self):
+        client = server.ClientState(PausedClient())
+        client.fail('Final recovery window expired; reconnect')
+        server.SESSION.on_source_done()
+        server.SESSION.on_source_connect()
+        client.check_recovery()
+        self.assertEqual(client.failure_reason,
+                         'Final recovery window expired; reconnect')
 
     async def test_stream_reset_closes_old_delivery_state(self):
         ws = PausedClient()
@@ -230,12 +238,14 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         ws = PausedLiveClient()
         client = await self.connect(ws)
         client.MAX_PENDING = 1
-        await server.ingest_caption_update(caption(1))
+        now = server.time.monotonic()
+        with patch.object(server.time, 'monotonic', return_value=now - 71):
+            await server.ingest_caption_update(caption(1))
         await ws.live_started.wait()
-        await server.ingest_caption_update(caption(2))
-        await server.ingest_caption_update(caption(3))
-        server.SESSION._history.popleft()
-        server.SESSION._expired_sequence += 1
+        with patch.object(server.time, 'monotonic', return_value=now - 61):
+            await server.ingest_caption_update(caption(2))
+            await server.ingest_caption_update(caption(3))
+        server.SESSION.prune_history()
         client.check_recovery()
         self.assertFalse(client.failed.is_set())
         ws.release_live.set()

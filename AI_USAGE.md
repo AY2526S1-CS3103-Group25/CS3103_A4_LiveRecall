@@ -116,6 +116,12 @@ Public T3 also challenged the assumption that a slow application necessarily pro
 
 **Evaluation:** bounded queues and blocked-send isolation are verified, but the implementation does not fully solve T3's slow-consumer completeness result. We did not silently drop normal provisional updates or modify the instructor harness to improve that number. Receiver-progress feedback or a separately measured transport policy would be needed to address this blind spot; the current measurements must be reported as a limitation, not a successful completeness result.
 
+Following LeongWZ’s delivery review, Codex consolidated coalescing into one pass, exposed a small sender-facing history API, and preserved the first failure reason. Expiry tests now advance receipt clocks rather than mutating shared history internals. All 29 server regressions and the six current-main client tests passed; the development startup check passed, while the final-file check still reports missing `report.pdf`. The repository-root regression command is recorded in AGENTS.md.
+
+Stream-reset disconnects remain deliberate: adopting a new stream in place cannot reset an unmodified client’s revision map, so keeping its socket open does not establish correct new-lecture display. Oversized updates still trigger shared catch-up to preserve the hard private-queue byte bound; treating them as already in flight from synchronous `offer` would require another staging slot or bypassing the sole sender. T3’s read budget suggests that earlier selective coalescing may help, but its trigger and timing must be measured on Ubuntu before claiming a solution.
+
+After integrating main and these review corrections, three new T4 runs each recovered 120 finals with 100% final completeness and zero duplicate/stale messages or connection errors. Median P95 caption age was 16.44 ms and HISTORY response P95 was 3.72 ms on macOS; raw outputs remain ignored under `results/review-update/`. These runs validate reconnect behavior after the receipt-clock change, not the unresolved large-HISTORY limit or T3 trigger.
+
 ## Responsibility statement
 
 We understand that the team remains responsible for the submitted code, experimental results, and claims, and that every member may be asked to explain or modify relevant code during the viva.
