@@ -130,7 +130,10 @@ The existing local caption state retains finals for 70 seconds, exceeding the
 required 60-second history. Selecting any window filters this state at the
 time of the click, without sending a WebSocket or HTTP request. The selected
 view also refreshes when a final is accepted and on the existing five-second
-cleanup timer, including while the source is idle. Recall does not force
+cleanup timer, including while the source is idle. When the visible finalized
+entries are unchanged, their DOM rows are preserved so idle cleanup ticks and
+equivalent window selections do not clear text selection. Headings and empty
+messages still reflect the selected window. Recall does not force
 scrolling to the newest row. During disconnection, previously received finals
 remain available until their local windows expire. Reloading clears this
 in-memory history.

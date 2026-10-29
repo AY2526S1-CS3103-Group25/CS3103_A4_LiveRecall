@@ -27,6 +27,7 @@ const recallHeadingEl = document.getElementById("recall-heading");
 const recallEmptyEl = document.getElementById("recall-empty");
 const recallButtons = Array.from(document.querySelectorAll("button[data-seconds]"));
 let recallSeconds = 30;
+let renderedRecallEntries = null;
 
 // One accepted caption and DOM row per segment in the single L1 session.
 const captionsBySegment = new Map();
@@ -80,6 +81,16 @@ function renderRecall() {
   const finals = Array.from(captionsBySegment.values())
     .filter(entry => entry.caption.final && entry.lastUpdatedAt >= cutoff)
     .sort((a, b) => a.caption.segment - b.caption.segment);
+  recallEl.hidden = finals.length === 0;
+  recallEmptyEl.hidden = finals.length > 0;
+  const message = `No finalized captions in the previous ${recallSeconds} seconds.`;
+  if (recallEmptyEl.textContent !== message) recallEmptyEl.textContent = message;
+
+  // Accepted finals are immutable. Keep their DOM nodes when the ordered
+  // entries are unchanged, preserving selection across idle cleanup ticks.
+  if (renderedRecallEntries && finals.length === renderedRecallEntries.length &&
+      finals.every((entry, index) => entry === renderedRecallEntries[index])) return;
+
   const fragment = document.createDocumentFragment();
   for (const entry of finals) {
     // Separate rows leave the live pane intact; source text stays plain text.
@@ -92,10 +103,7 @@ function renderRecall() {
   // One argument avoids the JavaScript argument limit for large local windows.
   recallEl.replaceChildren(fragment);
   recallEl.scrollTop = scrollTop;
-  recallEl.hidden = finals.length === 0;
-  recallEmptyEl.hidden = finals.length > 0;
-  const message = `No finalized captions in the previous ${recallSeconds} seconds.`;
-  if (recallEmptyEl.textContent !== message) recallEmptyEl.textContent = message;
+  renderedRecallEntries = finals;
 }
 
 function selectRecallWindow(seconds) {

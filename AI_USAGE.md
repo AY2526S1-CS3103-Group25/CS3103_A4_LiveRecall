@@ -1,122 +1,95 @@
 # AI / Coding-Assistant Usage
 
-## How AI helped
+## How AI was used
 
-Claude Code and Codex were used to explain networking concepts, discuss design
-options, draft implementation changes, suggest tests, and improve documentation.
-Automated Claude Code reviews also helped identify validation problems and edge
-cases that needed further investigation.
+### Server protocol ingestion (issue #1)
 
-The assistance covered caption ingestion, revision replacement, client cleanup,
-local recall, and interface behavior. AI was useful for identifying interactions
-between these areas, such as how rejecting an update can affect final-caption
-completeness or how retaining every caption can cause memory growth.
+- **Claude Code (Anthropic, Fable 5 model)** — interactive CLI agent used to plan and implement the server-side protocol ingestion (issue #1 / PR #20): the `CaptionUpdate` validation layer in `solution_server.py`, ad-hoc protocol probe scripts used during testing, and the PR/issue write-ups. All generated code was reviewed by the team and verified against the public test harness before merging.
+- **Claude Code automated PR review (GitHub Actions, `claude-sonnet-5-5`)** — the workflow in `.github/workflows/` reviews every PR and leaves inline comments; its findings on PR #20 were triaged by the team and either applied or argued against in the review threads.
 
-Suggestions were evaluated against the assignment requirements and existing code.
-We revised proposals when their assumptions, resource use, or behavior did not
-fit the project.
+### Live caption display (issue #3)
+
+AI was used as an implementation and review aid to discuss design options,
+draft parts of the caption display logic, and identify edge cases. Proposed
+changes were evaluated against the assignment's revision rules, bounded-state
+requirements, and need for simple, understandable code.
 
 ## Useful suggestions
 
-Keeping one display row per caption segment made revision replacement easier to
-understand and prevented every provisional update from appearing as another
-line. This approach still needed explicit checks to reject older revisions and
-protect accepted final captions.
+### Preserving server updates with recoverable field errors
 
-Reusing the client's existing recent-caption state for recall avoided maintaining
-a second transcript. The recall controls filter locally stored finalized captions
-for the selected window, so changing the view does not require a server request
-and previously received captions remain accessible during a disconnection.
+The automated reviewer flagged that our first ingestion implementation dropped any `CAPTION_UPDATE` failing strict validation — including a `final=true` update with a missing or non-numeric `source_ts`, and later the same problem for a missing or non-string `text`. Since a dropped final can never be recovered (the protocol has no retransmit, and Final Caption Completeness counts unique finals delivered), one malformed field would have permanently cost score in the graded tests.
 
-AI also helped identify malformed-input cases and draft controlled-clock checks.
-These checks made it practical to examine expiry boundaries and delayed updates
-without waiting through a full lecture each time.
+We split the fields by what a wrong guess costs. An invalid `source_ts` is replaced with the server's receive time (commit `9ed84a2`) and an invalid `text` with an empty string (commit `3430a12`), in both cases patching the value into the forwarded payload so clients still parse it. The identity fields `segment`, `revision` and `final` stay strict, because a guessed value there would place the caption at the wrong position in the stream or deduplicate it against the wrong segment — corrupting session state, which is worse than dropping one frame. The assignment does not require these replacements: they keep an update from being dropped, but they cannot restore its original timestamp or its missing text.
 
-## Critical evaluation and changes
+**Verification:** a probe script sent updates with missing and `null` `source_ts`, a final with `text: 42`, plus a battery of genuinely malformed frames; the client received the defaulted updates (extra fields intact, the untouched field unchanged) while malformed frames were still dropped, and `run_demo.py --clients 20 --duration 20` reported 100% final-caption completeness with 0 duplicates/stale messages.
 
-### Balancing validation with caption delivery
+### Replacing caption revisions in one row
 
-An early implementation rejected updates whenever any field was invalid. Review
-showed that this could discard an otherwise usable final caption because its
-timestamp or text was missing. We kept strict validation for segment identity,
-revision, and final status, while allowing recoverable timestamp and text errors
-to receive defaults.
+Keeping one caption row per segment was a useful suggestion because it allows
+newer revisions to replace existing text without duplicate lines. The approach
+was adopted with explicit checks for older revisions and finalized captions.
+Browser checks verified these behaviors.
 
-This was a trade-off: a replacement timestamp or empty text can preserve delivery,
-but cannot recover the original information. We therefore distinguish accepting
-an update from guaranteeing that its original content or timing was preserved.
+## Suggestions that required modification
 
-### Bounding memory while preserving revision correctness
+### Server session validation
 
-An initial client design retained captions for the entire page session. We changed
-it to expire finalized captions and older inactive provisionals after a bounded
-retention period. Recently removed captions retain temporary revision guards so
-stale updates cannot immediately restore outdated text.
+The AI's initial implementation added a per-update session check: any `CAPTION_UPDATE` whose `session` field differed from the `SOURCE_HELLO` session was dropped:
 
-We also rejected a revision-handling exception that could accept an older final.
-The accepted rule allows an equal-revision final to complete a provisional, while
-rejecting older revisions. Blocking every segment below a single cutoff was also
-too broad because it could reject unseen captions; temporary records of the
-segments actually removed were used instead. These guards expire, so they do not
-provide permanent duplicate protection or complete reconnect recovery.
+```python
+elif isinstance(msg_session, str) and msg_session != session:
+    reason = f"session {msg_session!r} does not match {session!r}"
+```
 
-### Preserving useful context without presenting it as current
+**Problem:** the spec (Section 4.1) lists `session` among the `CAPTION_UPDATE` fields, but assigns it no meaning beyond identifying the lecture in `SOURCE_HELLO`. So the check was neither required nor forbidden by the assignment — removing it was our risk judgement, not the correction of a rules violation. The objection is that the comparison conveys no information while carrying a total failure mode: one source connection already *is* one session, so a matching `session` confirms nothing the connection had not already established, but if the hidden test source ever tagged its updates with a value differing from its hello, every caption — finals included — would be silently dropped and Final Caption Completeness would go to 0.
 
-Deleting an inactive unfinished caption would remove potentially useful context.
-Keeping it unchanged could make old text appear current. We chose to preserve the
-newest unfinished caption and label it stale after prolonged inactivity. Accepted
-updates clear that label; rejected updates do not reset the inactivity timer.
+**Correction:** removed the check entirely (commit `0f19fa5`); the session is identified by the connection's `SOURCE_HELLO`, and the update's own `session` field is now read by nothing and forwarded unmodified in the raw payload. Verified by probe (an update tagged `session: "L2"` after an `"L1"` hello is now forwarded) and a clean T1 run.
 
-### Choosing and applying recall timing deliberately
+### Bounded client state and revision protection
 
-We chose client receipt time for recall, measured with a monotonic clock when a
-final caption is first accepted. The assignment specifies the recall durations
-but does not prescribe this timing basis. The choice gives delayed finals their
-full local window and avoids depending on the source clock. It also means recall
-represents recently received finals rather than their exact lecture event times.
+The initial AI-assisted design kept every caption for the page session. Review
+identified that this would allow memory usage to grow throughout a lecture.
+The design was revised to remove finalized captions and their rows after about
+70 seconds, preserving the required recent window while limiting growth.
 
-Retaining enough history and displaying the selected window are separate concerns.
-The client keeps finals for 70 seconds, but recall independently filters the
-previous 15, 30, or 60 seconds. Duplicate or rejected updates must not extend a
-final's window, and the visible view must refresh even when the source is idle.
+An initial exception to the revision check was rejected because it could accept
+older finals. A refined condition was adopted: equal-revision finals may complete
+provisional captions, while older revisions remain rejected. Review also showed
+that blocking all IDs below the highest pruned segment could reject unseen
+captions. This was replaced with expiring records of only the IDs actually pruned.
 
-### Checking failures beyond the normal demonstration
+Further review identified abandoned provisional captions as another source of
+growth. Cleanup now removes older, superseded provisionals after 70 seconds
+without an accepted update, while preserving the newest active caption and
+allowing late finals. Restored rows are inserted by segment number to preserve
+display order. Reconnect recovery remains separate work.
 
-Additional AI-assisted review exposed cases that ordinary caption playback did
-not cover. Malformed text could throw during browser rendering, and blocked
-session storage could prevent the connection hello. We normalized invalid text
-and kept an in-memory identifier when storage is unavailable. Review also found
-that passing every recalled row as a separate function argument could fail for
-an unusually large window; a document fragment avoids that argument limit.
+## Issue #3 — evaluating caption reliability and usability
 
-On the server, a numeric value that overflowed Python's floating-point range
-could become invalid JSON when another field was repaired. Non-finite numbers
-are now normalized before re-serialization, including inside unknown extra
-fields. Binary UTF-8 source frames are decoded to text before forwarding so the
-browser receives JSON text rather than binary objects. These changes preserve
-valid caption content and were checked against the original failure cases.
+During review with AI, I found that an abandoned provisional caption could look
+current indefinitely. The suggestion was to delete it, but I questioned whether
+that would remove useful context. I chose to preserve the newest unfinished text
+and mark it "PROVISIONAL — STALE" after 70 seconds without an accepted update.
+Rejected revisions do not reset the timer; an accepted newer revision or final
+clears the label. The existing five-second cleanup timer detects staleness at
+about 70–75 seconds. Finals and older provisionals still expire after roughly
+70 seconds, with revision/finality guards retained for one extra 70-second
+window, so duplicate protection remains temporary.
 
-## Verification and limitations
+I also evaluated AI suggestions for internal scrolling, input validation, and
+empty-state messages. I adopted them while keeping recall controls outside the
+scrolling pane, validating updates before state changes, allowing unknown fields,
+and placing the empty status outside the caption rows to preserve their order.
+Six controlled-clock regressions and desktop/mobile Chromium checks with mocked
+WebSocket messages passed, and the UI detector reported no findings. The real
+server demo and submission startup check remained unverified because the sandbox
+blocked port binding.
 
-Earlier development records include server probes, a basic public test run, and
-browser checks. Controlled-clock client checks covered revision replacement,
-final protection, malformed messages, recall boundaries, misleading source
-timestamps, expiry, and local selection while disconnected. The development test
-folder was later removed from the submission folder at the user's request.
+## Additional reflection
 
-A subsequent review ran 17 client checks and eight server checks from temporary
-files outside the submission folder; all passed. The checks included malformed
-values, blocked storage, numeric overflow, binary frames, and a large recall
-window. They exercise application code with controlled DOM and socket adapters.
-
-These checks do not establish complete networking correctness or performance.
-Verification of the latest recall interface with the real server and browser
-remains unfinished because of port-binding and browser-automation restrictions.
-AI-generated explanations and passing isolated checks are not substitutes for
-the required application demonstration and Ubuntu experiments.
+Codex helped me explore the local recall design and check edge cases. I chose to reuse locally stored finalized captions and measure recall from client receipt time, so switching windows needs no server request and delayed captions get a full local window. I also questioned rebuilding unchanged content because it could interrupt text selection, and changed the renderer to preserve those rows.
 
 ## Responsibility statement
 
-The team remains responsible for the submitted code, experimental results, and
-claims. We must be able to explain the design choices, identify their limitations,
-and modify the implementation during the viva.
+We understand that the team remains responsible for the submitted code, experimental results, and claims, and that every member may be asked to explain or modify relevant code during the viva.
