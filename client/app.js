@@ -4,7 +4,7 @@
  *
  * Implemented behavior:
  *   - opens a WebSocket
- *   - sends CLIENT_HELLO, resuming from the latest finalized caption held locally
+ *   - sends CLIENT_HELLO, resuming from the highest contiguous finalized caption held locally
  *   - replaces accepted revisions in the same caption row
  *   - distinguishes provisional/final captions and protects finalized text
  *   - removes expired finals and abandoned provisional rows
@@ -36,10 +36,41 @@ const captionsBySegment = new Map();
 const prunedSegments = new Map();
 // Used only for cleanup: older provisionals may be abandoned as the stream moves on.
 let latestSegment = 0;
-// Resume state for CLIENT_HELLO: the latest FINALIZED caption this client holds.
-// Updated only where captions are accepted (acceptCaptionUpdate), so it always
-// reflects what this client actually keeps, never a provisional it glimpsed.
-let latestFinal = { segment: 0, revision: 0 };
+// Resume state for CLIENT_HELLO: the highest segment N such that this client
+// holds every finalized caption from its first received final through N.
+// We report this contiguous run rather than a high-water mark: the server may
+// skip everything at or below the reported point, so a mark that jumps over a
+// segment we never got would make that segment unreachable.
+// pendingFinals only ever holds segments *above* the run head (gaps), so its
+// size is bounded by the size of any out-of-order delivery window.
+const pendingFinals = new Map(); // segment -> revision of held, not-yet-contiguous finals
+let contiguousFinal = { segment: 0, revision: 0 };
+let sawFirstFinal = false;
+
+function recordFinalForResume(segment, revision) {
+  if (!sawFirstFinal) {
+    // The first final this tab accepts anchors the run; the live stream is
+    // ordered, so it is the smallest segment this client will ever hold.
+    sawFirstFinal = true;
+    contiguousFinal = { segment, revision };
+    return;
+  }
+  if (segment <= contiguousFinal.segment) return; // at/below the head: already covered
+  if (segment === contiguousFinal.segment + 1) {
+    contiguousFinal = { segment, revision };
+    pendingFinals.delete(segment);
+    // Fold in any higher finals already held, in order.
+    while (pendingFinals.has(contiguousFinal.segment + 1)) {
+      const next = contiguousFinal.segment + 1;
+      contiguousFinal = { segment: next, revision: pendingFinals.get(next) };
+      pendingFinals.delete(next);
+    }
+  } else {
+    // Gap above the head: hold the final until (if ever) the missing segment
+    // arrives; the resume report stays at the run head meanwhile.
+    pendingFinals.set(segment, revision);
+  }
+}
 
 let ws;
 // Reconnect bookkeeping. The timer is cleared before each new dial so a
@@ -112,11 +143,10 @@ function acceptCaptionUpdate(msg) {
   // A late final or newer revision can restore a pruned provisional caption.
   prunedSegments.delete(msg.segment);
   latestSegment = Math.max(latestSegment, msg.segment);
-  // Resume state follows finalized captions only, and never regresses, so a
-  // late or duplicate final cannot push the reported resume point backwards.
-  if (msg.final && msg.segment > latestFinal.segment) {
-    latestFinal = { segment: msg.segment, revision: msg.revision };
-  }
+  // Resume state follows finalized captions only; recordFinalForResume keeps
+  // a contiguous run, so the reported point is never past a segment this
+  // client does not actually hold.
+  if (msg.final) recordFinalForResume(msg.segment, msg.revision);
   updateEmptyState();
   liveEl.scrollTop = liveEl.scrollHeight;
 }
@@ -169,8 +199,8 @@ function connect() {
       type: "CLIENT_HELLO",
       client_id: numericClientId(),
       session: "L1",
-      last_segment: latestFinal.segment,
-      last_revision: latestFinal.revision,
+      last_segment: contiguousFinal.segment,
+      last_revision: contiguousFinal.revision,
       history_seconds: 30
     }));
   });
