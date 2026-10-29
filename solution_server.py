@@ -56,6 +56,211 @@ class CaptionUpdate:
     payload: str
 
 
+class SessionState:
+    """Latest accepted (revision, final) per segment for the single live session.
+
+    Module-level lifetime, independent of any connection: state persists
+    across a mid-stream source disconnect/reconnect so replayed frames stay
+    deduplicated, but resets when a new source connects after the previous
+    stream completed with SOURCE_DONE (a fresh lecture restarting at
+    segment 1 must be deliverable without a server restart). SOURCE_DONE is
+    not guaranteed — a source killed mid-stream never sends it — so there is
+    a fallback: a provisional segment-1 revision-1 frame arriving as the
+    first frame after a SOURCE_HELLO, while segment 1 is already closed,
+    also resets, since a conforming source numbers segments monotonically
+    from 1 and a new stream's s1r1 can only sit in that position (see
+    apply()).
+
+    Memory: the contiguous finalized prefix is compacted to the
+    `closed_up_to` watermark and pruned from `segments`; durability for
+    everything at or below the watermark is enforced by the single int, so
+    late replays of old finals are still rejected after pruning. Correctness
+    does not depend on finalization order — the watermark only advances over
+    a contiguous finalized prefix, and out-of-order segments simply stay in
+    the dict until the gap closes. The O(1) size (just the active segment)
+    relies on in-order finalization, which the spec guarantees only for the
+    starter-kit source; for any other ordering the dict grows with the
+    source's unfinalized window, hard-capped at MAX_TRACKED_SEGMENTS by
+    force-closing the oldest tracked segments. A force-closed segment that
+    never finalized stays eligible for exactly one late final (reopenable),
+    so capping never costs a final for any segment the server actually saw;
+    the only finals forfeited are for segment numbers first appearing > 1024
+    segments behind the frontier, or gap numbers never seen before a forced
+    watermark advance.
+    """
+
+    # Hard cap on tracked (unpruned) segments. The instructor source keeps the
+    # window at ~1 active segment; the cap only matters if one segment never
+    # finalizes (e.g. its final frame was malformed and dropped), which would
+    # otherwise stall the watermark and let later entries accumulate forever.
+    MAX_TRACKED_SEGMENTS = 1024
+
+    # Hard cap on remembered force-closed-but-never-finalized segments (the
+    # ones still eligible for one late final). Only reachable under an
+    # adversarial flood of never-finalized segments; beyond it, the oldest
+    # lose their late-final eligibility.
+    MAX_REOPENABLE_SEGMENTS = 1024
+
+    def __init__(self) -> None:
+        self._closed_up_to = 0  # every segment <= this is closed and pruned
+        self._segments: dict[int, tuple[int, bool]] = {}
+        # Force-closed segments that never finalized: their (single) late
+        # final is still accepted, so capping doesn't cost tracked finals.
+        self._reopenable: set[int] = set()
+        self._done = False  # previous source completed with SOURCE_DONE
+        # A CAPTION_UPDATE arrived since the last SOURCE_HELLO: the fallback
+        # reset in apply() may only fire before this flips (a new stream's
+        # s1r1 can only ever be a connection's first frame).
+        self._stream_started = False
+        self._dropped_stale = 0
+        self._dropped_duplicate = 0
+        self._dropped_post_final = 0
+        self._force_closed = 0
+
+    def on_source_connect(self) -> None:
+        """Reset for a fresh stream iff the previous one completed.
+
+        A new SOURCE_HELLO after a SOURCE_DONE is a new lecture whose segments
+        restart at 1 — without a reset every frame would be rejected as
+        post-final. A reconnect WITHOUT a prior SOURCE_DONE (crash, network
+        drop) keeps state, so frames the source replays stay deduplicated; if
+        that connection turns out to be a new stream instead of a replaying
+        one, the segment-1 fallback in apply() catches it.
+        """
+        if self._done:
+            print(
+                f"new source after SOURCE_DONE: resetting ({self.drop_summary()})",
+                flush=True,
+            )
+            self.__init__()
+        self._stream_started = False
+
+    def on_source_done(self) -> None:
+        self._done = True
+
+    def apply(self, update: CaptionUpdate) -> bool:
+        """Record the update; return True if it should be delivered to clients.
+
+        Synchronous on purpose: the check-and-set must not be interrupted by an
+        await, so concurrent ingests on the event loop cannot double-accept.
+
+        New-stream fallback (before the ladder): a provisional segment-1
+        revision-1 frame that is the FIRST frame after a SOURCE_HELLO, while
+        segment 1 is already closed, resets the session. A conforming source
+        numbers segments monotonically from 1, so a new stream's s1r1 can
+        only sit in that exact position; it means the previous stream's
+        source was killed before sending SOURCE_DONE (e.g. Ctrl-C, then
+        rerun against the same server), and without the reset the whole new
+        lecture would be silently dropped as post-final. Deliberately
+        narrow: once any frame has arrived on the connection the fallback is
+        disarmed (a mid-stream or mid-replay s1r1 retransmit can never wipe
+        state), a FINAL s1r1 never triggers it (so a replayed reopenable
+        late final can't either), and a reopenable segment 1 is excluded
+        (its late final must stay deliverable). The one case this misreads —
+        a reconnecting source that replays its whole stream from s1r1 — is
+        informationally indistinguishable from a new lecture, and treating
+        it as one re-broadcasts duplicates instead of silencing a real
+        lecture; no harness component replays at all.
+
+        Reject ladder, top to bottom:
+        - closed segment (<= watermark): dead, except the single late final
+          of a force-closed, never-finalized segment (`_reopenable`);
+        - already-final segment: finals are durable, nothing may follow;
+        - lower revision: stale, even if marked final — finalizing on it
+          would durably bind the segment to older text than clients already
+          displayed;
+        - same revision, provisional: duplicate.
+        Everything else is stored and delivered: a first-seen segment, a
+        strictly newer revision, or a final at exactly the stored provisional
+        revision — a source may legally promote the last provisional in
+        place, so that final is delivered (once) and the segment closes.
+        """
+        seg = update.segment
+        if (
+            not self._stream_started
+            and seg == 1
+            and update.revision == 1
+            and not update.final
+            and self._closed_up_to >= 1
+            and 1 not in self._reopenable
+        ):
+            print(
+                "stream opens at segment 1 revision 1 but segment 1 is closed: "
+                f"treating as a new stream, resetting ({self.drop_summary()})",
+                flush=True,
+            )
+            self.__init__()
+        self._stream_started = True
+        if seg <= self._closed_up_to:
+            if update.final and seg in self._reopenable:
+                self._reopenable.discard(seg)
+                return True
+            self._dropped_post_final += 1
+            return False
+        stored = self._segments.get(seg)
+        if stored is not None:
+            revision, final = stored
+            if final:
+                self._dropped_post_final += 1
+                return False
+            if update.revision < revision:
+                self._dropped_stale += 1
+                return False
+            if update.revision == revision and not update.final:
+                self._dropped_duplicate += 1
+                return False
+        self._segments[seg] = (update.revision, update.final)
+        if update.final:
+            self._compact()
+        if len(self._segments) > self.MAX_TRACKED_SEGMENTS:
+            self._force_close_oldest()
+        return True
+
+    def _compact(self) -> None:
+        # Advance the watermark over the contiguous finalized prefix and drop
+        # those entries; their durability is now carried by _closed_up_to.
+        nxt = self._closed_up_to + 1
+        entry = self._segments.get(nxt)
+        while entry is not None and entry[1]:
+            del self._segments[nxt]
+            self._closed_up_to = nxt
+            nxt += 1
+            entry = self._segments.get(nxt)
+
+    def _force_close_oldest(self) -> None:
+        # A never-finalized segment stalls the watermark; cap memory by
+        # force-closing the oldest tracked segments. A closed segment that
+        # never finalized stays acceptable for exactly one late final (via
+        # `_reopenable`), so the cap bounds state without losing finals; only
+        # its provisional revision history is forgotten, which risks at most
+        # re-relaying a replayed provisional, never a duplicate final.
+        for seg in sorted(self._segments):
+            if len(self._segments) <= self.MAX_TRACKED_SEGMENTS:
+                break
+            _, final = self._segments.pop(seg)
+            self._force_closed += 1
+            if not final:
+                self._reopenable.add(seg)
+            if seg > self._closed_up_to:
+                self._closed_up_to = seg
+        # Bound the reopen set too (relevant only under adversarial floods of
+        # never-finalized segments); oldest entries are the ones given up.
+        while len(self._reopenable) > self.MAX_REOPENABLE_SEGMENTS:
+            self._reopenable.discard(min(self._reopenable))
+        self._compact()
+
+    def drop_summary(self) -> str:
+        return (
+            f"dropped(stale={self._dropped_stale} "
+            f"dup={self._dropped_duplicate} "
+            f"post_final={self._dropped_post_final}) "
+            f"force_closed={self._force_closed}"
+        )
+
+
+SESSION = SessionState()
+
+
 def _is_positive_int(value: Any) -> bool:
     # bool is a subclass of int, so it must be rejected explicitly.
     return isinstance(value, int) and not isinstance(value, bool) and value >= 1
@@ -159,11 +364,15 @@ def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
 
 
 async def ingest_caption_update(update: CaptionUpdate) -> None:
-    """Entry point for validated caption updates.
+    """Gate validated caption updates through the revision state, then relay.
 
-    The session-state manager (revision dedup + broadcast policy) replaces
-    this body; ingestion/parsing above stays unchanged.
+    Pipeline: parse_caption_update (shape) -> SESSION.apply (revision gate)
+    -> broadcast. State is committed before the broadcast await, so an update
+    arriving during a slow broadcast still sees it. Per-client queueing and
+    overload coalescing replace the broadcast side, not this gate.
     """
+    if not SESSION.apply(update):
+        return
     await broadcast_naively(update.payload)
 
 
@@ -193,6 +402,7 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
     # the only source over a missing label would stop every caption.
     session = hello.get("session")
     print(f"source connected: session={session!r}", flush=True)
+    SESSION.on_source_connect()
 
     try:
         async for raw in ws:
@@ -216,12 +426,13 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
                 print(f"source finished: segments={msg.get('segments')}", flush=True)
+                SESSION.on_source_done()
             else:
                 # Forward compatibility: ignore fields/messages this baseline
                 # doesn't understand rather than crashing.
                 continue
     finally:
-        print("source disconnected", flush=True)
+        print(f"source disconnected: {SESSION.drop_summary()}", flush=True)
 
 
 async def handle_client(ws, hello: dict[str, Any]) -> None:

@@ -4,8 +4,8 @@
 
 ### Server protocol ingestion (issue #1)
 
-- **Claude Code (Anthropic, Fable 5 model)** — interactive CLI agent used to plan and implement the server-side protocol ingestion (issue #1 / PR #20): the `CaptionUpdate` validation layer in `solution_server.py`, ad-hoc protocol probe scripts used during testing, and the PR/issue write-ups. All generated code was reviewed by the team and verified against the public test harness before merging.
-- **Claude Code automated PR review (GitHub Actions, `claude-sonnet-5-5`)** — the workflow in `.github/workflows/` reviews every PR and leaves inline comments; its findings on PR #20 were triaged by the team and either applied or argued against in the review threads.
+- **Claude Code (Anthropic, Fable 5 model)** — interactive CLI agent used to plan and implement the server-side protocol work in `solution_server.py`: the `CaptionUpdate` ingestion/validation layer (issue #1 / PR #20) and the `SessionState` revision-deduplication gate (issue #2 / PR #22), plus the ad-hoc protocol probe scripts used during testing and the PR/issue write-ups. All generated code was reviewed by the team and verified against the public test harness before merging.
+- **Claude Code automated PR review (GitHub Actions, `claude-sonnet-5-5`)** — the workflow in `.github/workflows/` reviews every PR and leaves inline comments; its findings were triaged by the team and either applied or argued against in the review threads.
 
 ### Live caption display (issue #3)
 
