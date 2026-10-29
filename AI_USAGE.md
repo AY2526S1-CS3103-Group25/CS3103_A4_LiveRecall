@@ -128,6 +128,8 @@ After integrating main and these review corrections, three new T4 runs each reco
 
 The final delivery integration sends all recovery batches through the same per-client sender before live updates, releases the snapshot after sending, and keeps ingestion free of client-I/O awaits. All 37 server regressions passed. A new test blocks the second HISTORY batch, floods live finals past the private queue limit, proves a normal client continues receiving, then verifies the slow client receives finals 1–40 once in order through shared catch-up. T3 receiver-progress detection remains tracked separately under #10.
 
+Three independent T4 runs on the final integrated delivery branch also achieved 100% final completeness, 120 recovered items per run and zero duplicate/stale/error counts. Median P95 caption age was 16.25 ms and recovery P95 was 3.27 ms on macOS. Raw results remain ignored under `results/issue9-closure/`. These validate #9’s isolation/recovery integration; #10 remains open for the T3 detection limitation.
+
 ## Responsibility statement
 
 We understand that the team remains responsible for the submitted code, experimental results, and claims, and that every member may be asked to explain or modify relevant code during the viva.
