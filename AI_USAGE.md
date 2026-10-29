@@ -1,14 +1,23 @@
 # AI / Coding-Assistant Usage
 
-## Tools used
+## How AI was used
+
+### Server protocol ingestion (issue #1)
 
 - **Claude Code (Anthropic, Fable 5 model)** — interactive CLI agent used to plan and implement the server-side protocol work in `solution_server.py`: the `CaptionUpdate` ingestion/validation layer (issue #1 / PR #20) and the `SessionState` revision-deduplication gate (issue #2 / PR #22), plus the ad-hoc protocol probe scripts used during testing and the PR/issue write-ups. All generated code was reviewed by the team and verified against the public test harness before merging.
 - **Claude Code automated PR review (GitHub Actions, `claude-sonnet-5-5`)** — the workflow in `.github/workflows/` reviews every PR and leaves inline comments; its findings were triaged by the team and either applied or argued against in the review threads.
 - **Codex (OpenAI)** — used to review the assignment specification and PR #22, plan and implement bounded server history and resume (issue #6), and write controlled-clock and WebSocket regression tests.
 
-(To be extended by teammates as further issues are worked on.)
+### Live caption display (issue #3)
 
-## One useful suggestion
+AI was used as an implementation and review aid to discuss design options,
+draft parts of the caption display logic, and identify edge cases. Proposed
+changes were evaluated against the assignment's revision rules, bounded-state
+requirements, and need for simple, understandable code.
+
+## Useful suggestions
+
+### Preserving server updates with recoverable field errors
 
 The automated reviewer flagged that our first ingestion implementation dropped any `CAPTION_UPDATE` failing strict validation — including a `final=true` update with a missing or non-numeric `source_ts`, and later the same problem for a missing or non-string `text`. Since a dropped final can never be recovered (the protocol has no retransmit, and Final Caption Completeness counts unique finals delivered), one malformed field would have permanently cost score in the graded tests.
 
@@ -20,7 +29,16 @@ Codex suggested keeping recent finalized payloads separate from the revision-sta
 
 **Verification:** all 13 history regressions and the startup check passed on macOS. Three independent runs each of T1 and T4 achieved 100% final completeness with zero duplicate/stale messages; each T4 run recovered 120 missed finals. Raw CSV/JSON outputs remain locally under `results/issue6/`. Ubuntu performance validation remains outstanding.
 
-## One suggestion that was wrong, inefficient, or required modification
+### Replacing caption revisions in one row
+
+Keeping one caption row per segment was a useful suggestion because it allows
+newer revisions to replace existing text without duplicate lines. The approach
+was adopted with explicit checks for older revisions and finalized captions.
+Browser checks verified these behaviors.
+
+## Suggestions that required modification
+
+### Server session validation
 
 The AI's initial implementation added a per-update session check: any `CAPTION_UPDATE` whose `session` field differed from the `SOURCE_HELLO` session was dropped:
 
@@ -38,6 +56,45 @@ Codex initially recommended requiring a contiguous finalized cursor rather than 
 **Problem:** this overstated the protocol requirement. Section 4.2 specifies the latest finalized segment/revision, and the starter source completes each segment before beginning the next. Requiring a different cursor would expand scope without establishing a need for it.
 
 **Correction:** kept the specified cursor semantics and filtered HISTORY by segment/revision. Out-of-order gaps cannot be inferred from that cursor alone and would require a separate protocol decision. Tests cover same-segment revision boundaries, late join, and incremental reconnect.
+### Bounded client state and revision protection
+
+The initial AI-assisted design kept every caption for the page session. Review
+identified that this would allow memory usage to grow throughout a lecture.
+The design was revised to remove finalized captions and their rows after about
+70 seconds, preserving the required recent window while limiting growth.
+
+An initial exception to the revision check was rejected because it could accept
+older finals. A refined condition was adopted: equal-revision finals may complete
+provisional captions, while older revisions remain rejected. Review also showed
+that blocking all IDs below the highest pruned segment could reject unseen
+captions. This was replaced with expiring records of only the IDs actually pruned.
+
+Further review identified abandoned provisional captions as another source of
+growth. Cleanup now removes older, superseded provisionals after 70 seconds
+without an accepted update, while preserving the newest active caption and
+allowing late finals. Restored rows are inserted by segment number to preserve
+display order. Reconnect recovery remains separate work.
+
+## Issue #3 — evaluating caption reliability and usability
+
+During review with AI, I found that an abandoned provisional caption could look
+current indefinitely. The suggestion was to delete it, but I questioned whether
+that would remove useful context. I chose to preserve the newest unfinished text
+and mark it "PROVISIONAL — STALE" after 70 seconds without an accepted update.
+Rejected revisions do not reset the timer; an accepted newer revision or final
+clears the label. The existing five-second cleanup timer detects staleness at
+about 70–75 seconds. Finals and older provisionals still expire after roughly
+70 seconds, with revision/finality guards retained for one extra 70-second
+window, so duplicate protection remains temporary.
+
+I also evaluated AI suggestions for internal scrolling, input validation, and
+empty-state messages. I adopted them while keeping recall controls outside the
+scrolling pane, validating updates before state changes, allowing unknown fields,
+and placing the empty status outside the caption rows to preserve their order.
+Six controlled-clock regressions and desktop/mobile Chromium checks with mocked
+WebSocket messages passed, and the UI detector reported no findings. The real
+server demo and submission startup check remained unverified because the sandbox
+blocked port binding.
 
 ## Responsibility statement
 
