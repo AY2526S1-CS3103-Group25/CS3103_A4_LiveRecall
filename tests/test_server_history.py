@@ -240,7 +240,7 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
         try:
             await asyncio.wait_for(client.history_started.wait(), 1)
             await server.ingest_caption_update(caption(1))
-            await asyncio.wait_for(handler, 1)
+            await asyncio.wait_for(asyncio.gather(handler, return_exceptions=True), 1)
             self.assertTrue(client.finished.is_set())
             self.assertNotIn(client, server.CLIENTS)
         finally:
@@ -260,6 +260,10 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0)
                 client.release_history.set()
                 await asyncio.wait_for(live, 1)
+                async def delivered():
+                    while not any(m.get('segment') == 9 for m in client.messages):
+                        await asyncio.sleep(0)
+                await asyncio.wait_for(delivered(), 1)
                 histories = client.messages[:-1]
                 self.assertGreater(len(histories), 1)
                 self.assertTrue(all(m['type'] == 'HISTORY' for m in histories))

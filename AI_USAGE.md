@@ -100,6 +100,8 @@ Review by LeongWZ exposed a clock-skew assumption in the original HISTORY select
 
 **Verification:** all 21 server regressions and 11 current-main client regressions passed, and the startup check passed. A real WebSocket receiver with max_size=1 MiB recovered all 20,000 finals in order and then received a live final; tests also cover UTF-8 byte budgets, the single-caption wrapper boundary, multi-batch handoff and failed-send closure. An isolated probe of the actual #8 client at 7b32381 merged server-generated HISTORY batches and the standalone-caption fallback without duplicate rows and resumed from segment 9. The browser on main still defers HISTORY merging to #8. Failed broadcast sends now close their sockets so handlers do not remain open without delivery; bounded slow-client isolation remains #9.
 
+Three independent T4 runs on the completed #6 branch each recovered 120 missed finals with 100% final completeness and zero duplicate/stale messages or connection errors. Median P95 caption age was 16.48 ms and HISTORY response P95 was 3.43 ms on macOS. Raw results remain ignored under `results/issue6-closure/`; Ubuntu measurements are still outstanding.
+
 ## Responsibility statement
 
 We understand that the team remains responsible for the submitted code, experimental results, and claims, and that every member may be asked to explain or modify relevant code during the viva.
