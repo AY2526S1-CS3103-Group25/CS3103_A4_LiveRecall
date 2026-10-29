@@ -111,9 +111,12 @@ function recordFinalForResume(segment, revision) {
 
 let ws;
 // Reconnect bookkeeping. The timer is cleared before each new dial so a
-// stale schedule can never open a duplicate connection.
+// stale schedule can never open a duplicate connection. openedAt is the
+// time of the last successful open (-1 if the current socket never opened),
+// so a connection must actually survive before it may reset the backoff.
 let reconnectAttempts = 0;
 let reconnectTimer = null;
+let openedAt = -1;
 
 function numericClientId() {
   const key = "liverecall-client-id";
@@ -198,6 +201,10 @@ function pruneExpiredCaptions() {
   for (const [segment, held] of pendingFinals) {
     if (held.parkedAt <= cutoff) pendingFinals.delete(segment);
   }
+  // No parked entry left means no gap is observed any more: drop the stale
+  // observation time so a later gap is aged from its own first evidence
+  // instead of inheriting an already-expired age.
+  if (pendingFinals.size === 0) gapSince = 0;
   // Abandon the gap itself once its own age passed the window: resume from
   // the oldest parked final instead of letting the head stick. gapSince is
   // only ever set from real observation times, never reset to "now".
@@ -238,7 +245,9 @@ function pruneExpiredCaptions() {
 
 function setStatus(text, connected = false) {
   statusEl.textContent = text;
-  statusEl.style.color = connected ? "green" : "tomato";
+  // Colour lives in the stylesheet (see .status-* rules in index.html),
+  // matching how the caption rows are styled.
+  statusEl.className = connected ? "status-connected" : "status-offline";
 }
 
 function connect() {
@@ -252,7 +261,7 @@ function connect() {
   ws = socket;
 
   socket.addEventListener("open", () => {
-    reconnectAttempts = 0;
+    openedAt = performance.now();
     setStatus("connected", true);
     socket.send(JSON.stringify({
       type: "CLIENT_HELLO",
@@ -291,9 +300,18 @@ function connect() {
     // A late close from a socket that has already been replaced must not
     // reschedule a second, duplicate reconnection.
     if (socket !== ws) return;
+    // Only a connection that actually survived earns a fresh backoff. A
+    // flash open (accepted, then immediately dropped) must not reset the
+    // counter, or a failing server would be hammered at a steady 1 Hz.
+    if (openedAt >= 0 && performance.now() - openedAt > RECONNECT_MAX_MS) {
+      reconnectAttempts = 0;
+    }
     const attempt = ++reconnectAttempts;
     setStatus(`disconnected - reconnecting (attempt ${attempt})`);
-    const delay = Math.min(RECONNECT_BASE_MS * 2 ** (attempt - 1), RECONNECT_MAX_MS);
+    // Jitter the delay between half and full so clients that lost the server
+    // at the same instant do not all redial on the same 1s/2s/4s/... schedule.
+    const base = Math.min(RECONNECT_BASE_MS * 2 ** (attempt - 1), RECONNECT_MAX_MS);
+    const delay = base * (0.5 + Math.random() / 2);
     reconnectTimer = setTimeout(connect, delay);
   });
 

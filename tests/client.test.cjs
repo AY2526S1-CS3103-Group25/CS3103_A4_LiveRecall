@@ -208,50 +208,61 @@ test("empty status distinguishes initial waiting from an expired live window", (
   assert.equal(c.empty.hidden, true);
 });
 
-test("reconnect uses capped exponential backoff and a successful open resets it", () => {
+test("reconnect backoff caps at 10 s, jitters, and resets only after a surviving open", () => {
   const c = client();
-  c.close();
-  assert.match(c.status.textContent, /disconnected - reconnecting \(attempt 1\)/);
-  c.advance(999);
-  assert.equal(c.sockets.length, 1);
-  c.advance(1);
-  assert.equal(c.sockets.length, 2);
+  const dials = () => c.sockets.length;
+  // Jittered delays land in [half, full] of the base, so each dial is
+  // asserted inside that band regardless of the random draw.
+  c.close(); // attempt 1: delay in [500, 1000] ms
+  assert.match(c.status.textContent, /reconnecting \(attempt 1\)/);
+  c.advance(499);
+  assert.equal(dials(), 1);
+  c.advance(501);
+  assert.equal(dials(), 2);
   assert.equal(c.status.textContent, "connecting");
 
-  // Never opened, so each close escalates: 2 s, then 4 s, then 8 s.
-  c.close();
+  // Never opened, so each close escalates: 2 s, 4 s, 8 s.
+  c.close(); // attempt 2: delay in [1000, 2000] ms
   assert.match(c.status.textContent, /reconnecting \(attempt 2\)/);
-  c.advance(1999);
-  assert.equal(c.sockets.length, 2);
-  c.advance(1);
-  assert.equal(c.sockets.length, 3);
-  c.close();
+  c.advance(999);
+  assert.equal(dials(), 2);
+  c.advance(1001);
+  assert.equal(dials(), 3);
+  c.close(); // attempt 3: delay in [2000, 4000] ms
   assert.match(c.status.textContent, /reconnecting \(attempt 3\)/);
-  c.advance(4000);
-  assert.equal(c.sockets.length, 4);
-  c.close();
+  c.advance(1999);
+  assert.equal(dials(), 3);
+  c.advance(2001);
+  assert.equal(dials(), 4);
+  c.close(); // attempt 4: delay in [4000, 8000] ms
   assert.match(c.status.textContent, /reconnecting \(attempt 4\)/);
-  c.advance(8000);
-  assert.equal(c.sockets.length, 5);
+  c.advance(3999);
+  assert.equal(dials(), 4);
+  c.advance(4001);
+  assert.equal(dials(), 5);
 
-  // The next delay (16 s) is capped at 10 s.
+  // The next base (16 s) is capped at 10 s, so the delay is in [5000, 10000].
   c.close();
   assert.match(c.status.textContent, /reconnecting \(attempt 5\)/);
-  c.advance(9999);
-  assert.equal(c.sockets.length, 5);
-  c.advance(1);
-  assert.equal(c.sockets.length, 6);
+  c.advance(10001);
+  assert.equal(dials(), 6);
 
-  // A successful open resets the counter back to attempt 1.
+  // An open that survives longer than the cap resets the counter...
   c.open();
   assert.equal(c.status.textContent, "connected");
+  c.advance(11000);
   c.close();
   assert.match(c.status.textContent, /reconnecting \(attempt 1\)/);
+
+  // ...but a flash open (accepted, immediately dropped) must not reset it.
+  c.open();
+  c.close();
+  assert.match(c.status.textContent, /reconnecting \(attempt 2\)/);
 });
 
 test("a late close from a replaced socket cannot schedule a duplicate reconnect", () => {
   const c = client();
-  c.close(); // socket 1 -> attempt 1, timer at +1 s
+  c.close(); // socket 1 -> attempt 1, timer at most 1 s away
   c.advance(1000); // the timer dials socket 2
   assert.equal(c.sockets.length, 2);
   c.sockets[0].close(); // stale close event from the replaced socket 1
@@ -281,11 +292,27 @@ test("hello resumes from the contiguous final run, not a high-water mark", () =>
   assert.deepEqual([hello.last_segment, hello.last_revision], [1, 3]);
 
   c.send(2, 4, true); // fills the gap: the run is now 1..3
-  c.close();
-  c.advance(1000);
+  c.close(); // attempt 2: dial at most 2 s away
+  c.advance(2000);
   c.open();
   const resumed = c.sockets[2].sent[0];
   assert.deepEqual([resumed.last_segment, resumed.last_revision], [3, 2]);
+});
+
+test("an emptied park buffer does not let a stale gap age skip recoverable finals", () => {
+  const c = client();
+  c.open();
+  c.send(1, 1, true);   // head = 1
+  c.advance(10_000);
+  c.send(3, 1, true);   // gap at 2 observed at t=10 s, final 3 parked
+  c.advance(80_000);    // t=90 s: parked final 3 ages out, buffer empties
+  c.send(50, 1, true);  // fresh evidence: segments 2..49 were never received
+  c.advance(5_000);     // one prune tick, far inside the 70 s window
+  c.close();
+  c.advance(1_000);
+  c.open();
+  const hello = c.sockets[c.sockets.length - 1].sent[0];
+  assert.equal(hello.last_segment, 1, "cursor jumped over never-received finals");
 });
 
 test("recurring gaps stay bounded: parked finals expire on their own age", () => {
