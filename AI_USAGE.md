@@ -120,7 +120,7 @@ Following LeongWZ’s delivery review, Codex consolidated coalescing into one pa
 
 Stream-reset disconnects remain deliberate: adopting a new stream in place cannot reset an unmodified client’s revision map, so keeping its socket open does not establish correct new-lecture display. Oversized updates still trigger shared catch-up to preserve the hard private-queue byte bound; treating them as already in flight from synchronous `offer` would require another staging slot or bypassing the sole sender. T3’s read budget suggests that earlier selective coalescing may help, but its trigger and timing must be measured on Ubuntu before claiming a solution.
 
-After integrating main and these review corrections, three new T4 runs each recovered 120 finals with 100% final completeness and zero duplicate/stale messages or connection errors. Median P95 caption age was 16.44 ms and HISTORY response P95 was 3.72 ms on macOS; raw outputs remain ignored under `results/review-update/`. These runs validate reconnect behavior after the receipt-clock change, not the unresolved large-HISTORY limit or T3 trigger.
+After integrating main and these review corrections, three new T4 runs each recovered 120 finals with 100% final completeness and zero duplicate/stale messages or connection errors. Median P95 caption age was 16.44 ms and HISTORY response P95 was 3.72 ms on macOS; raw outputs remain ignored under `results/review-update/`. Three fresh T1 runs also achieved 100% final completeness, freshness and revision coverage with zero duplicate/stale/error counts; median P95 caption age was 6.22 ms. These runs validate normal delivery and reconnect behavior after the receipt-clock change, not the unresolved large-HISTORY limit or T3 trigger.
 
 ## Responsibility statement
 
