@@ -7,6 +7,8 @@
   <style>
     body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
     #status { font-weight: 700; }
+    .status-connected { color: #15803d; }
+    .status-offline { color: #b91c1c; }
     #live { min-height: 6rem; max-height: min(24rem, 50vh); overflow-y: auto; border: 1px solid #bbb; border-radius: .4rem; padding: 1rem; margin: 1rem 0; }
     .caption-line { padding: .25rem 0; border-bottom: 1px dotted #ddd; overflow-wrap: anywhere; }
     .caption-provisional { color: #555; font-style: italic; }
@@ -18,7 +20,7 @@
 </head>
 <body>
   <h1>LiveRecall</h1>
-  <p>Connection: <span id="status">disconnected</span></p>
+  <p>Connection: <span id="status" class="status-offline" role="status">disconnected</span></p>
   <p class="hint">PROVISIONAL captions may change as you listen. FINAL captions are complete. Newer revisions replace the same line.</p>
   <div id="live" tabindex="0" role="region" aria-label="Live captions"></div>
   <p id="live-empty" class="hint" role="status">Waiting for captions.</p>
