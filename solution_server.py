@@ -21,13 +21,16 @@ import math
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 import websockets
 from websockets.exceptions import ConnectionClosed
 
 # Each connection owns its bounded pending work and its sole network sender.
 CLIENTS: dict[Any, ClientState] = {}
+
+# Match the mandatory load client's receive limit, including the JSON wrapper.
+MAX_HISTORY_MESSAGE_BYTES = 2**20
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,7 +107,8 @@ class SessionState:
         self._reopenable: set[int] = set()
         # Receipt order permits O(1) expiry, independently of source clock skew
         # or out-of-order finals. Revision compaction must not erase payloads.
-        self._history: deque[tuple[float, CaptionUpdate]] = deque()
+        # Decode once per retained final; snapshots share these read-only records.
+        self._history: deque[tuple[float, CaptionUpdate, dict[str, Any]]] = deque()
         # Receipt-order final positions let senders recover even out-of-order
         # segment finals, without a growing per-client set of delivered IDs.
         self._final_sequence = 0
@@ -228,7 +232,7 @@ class SessionState:
         self.prune_history()
         self._active.pop(update.segment, None)
         self._final_sequence += 1
-        self._history.append((time.monotonic(), update))
+        self._history.append((time.monotonic(), update, json.loads(update.payload)))
 
     def prune_history(self) -> None:
         cutoff = time.monotonic() - self.HISTORY_RETENTION_SECONDS
@@ -251,12 +255,12 @@ class SessionState:
             return []
         cutoff = time.monotonic() - history_seconds
         updates = [
-            update for received_at, update in self._history
+            (update, record) for received_at, update, record in self._history
             if received_at >= cutoff
             and (update.segment, update.revision) > (last_segment, last_revision)
         ]
-        return [json.loads(update.payload) for update in sorted(
-            updates, key=lambda update: update.segment
+        return [record for _, record in sorted(
+            updates, key=lambda entry: entry[0].segment
         )]
 
     @property
@@ -424,9 +428,47 @@ def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
     )
 
 
+def history_messages(items: list[dict[str, Any]]) -> Iterator[str]:
+    """Emit lossless recovery batches before live delivery, one message at a time.
+
+    The 70-second retention window is unchanged. Batching bounds wire messages
+    rather than throwing away finals to make the whole window fit one message.
+    An item that fits alone but not inside HISTORY uses CAPTION_UPDATE after an
+    initial HISTORY reply; the existing client accept path handles either form.
+    """
+    prefix, suffix = '{"type":"HISTORY","items":[', ']}'
+    empty_size = len(prefix) + len(suffix)
+    batch: list[str] = []
+    size = empty_size
+    replied = False
+    for item in items:
+        # Escape lone surrogates, but retain compact UTF-8 for normal captions.
+        encoded = json.dumps(item, ensure_ascii=False, separators=(',', ':'))
+        raw = encoded.encode('utf-8', errors='backslashreplace')
+        encoded = raw.decode('utf-8')
+        if batch and size + 1 + len(raw) > MAX_HISTORY_MESSAGE_BYTES:
+            yield prefix + ','.join(batch) + suffix
+            replied = True
+            batch = []
+            size = empty_size
+        if empty_size + len(raw) > MAX_HISTORY_MESSAGE_BYTES:
+            if not replied:
+                yield prefix + suffix
+                replied = True
+            if len(raw) > MAX_HISTORY_MESSAGE_BYTES:
+                raise ValueError('A caption exceeds the receiver message limit')
+            yield encoded
+        else:
+            size += len(raw) + bool(batch)
+            batch.append(encoded)
+    if batch or not replied:
+        yield prefix + ','.join(batch) + suffix
+
+
 class ClientState:
-    # Live pending work is capped by count and UTF-8 bytes. One initial HISTORY
-    # snapshot (bounded by the history window) and one in-flight frame are extra.
+    # Live pending work is capped by count and UTF-8 bytes. The initial recovery
+    # snapshot shares retained records; it is encoded one bounded batch at a time.
+    # The snapshot references and one in-flight frame are outside the live budget.
     # Oversized valid frames use catch-up's single-frame path, never the queue.
     MAX_PENDING = 128
     MAX_PENDING_BYTES = 256 * 1024
@@ -543,9 +585,14 @@ class ClientState:
             self.send_started = None
             self.in_flight_sequence = 0
 
-    async def run(self, history: str) -> None:
-        await self._send(history)
-        del history
+    async def run(self, history: list[dict[str, Any]]) -> None:
+        for message in history_messages(history):
+            self.check_recovery()
+            if self.failed.is_set():
+                return
+            await self._send(message)
+            await asyncio.sleep(0)
+        del history, message
         while not self.failed.is_set():
             self.check_recovery()
             if self.failed.is_set():
@@ -645,7 +692,7 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
     items = SESSION.history_items(last_segment, last_revision, seconds)
     client = ClientState(ws)
     CLIENTS[ws] = client
-    sender = asyncio.create_task(client.run(json.dumps({"type": "HISTORY", "items": items})))
+    sender = asyncio.create_task(client.run(items))
     del items
 
     async def receive() -> None:

@@ -122,6 +122,47 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.state._history), 0)
 
 
+class HistoryMessageTests(unittest.TestCase):
+    def test_large_snapshot_is_lossless_and_each_message_fits_receiver(self):
+        items = [json.loads(caption(segment).payload)
+                 for segment in range(1, 20001)]
+        messages = list(server.history_messages(items))
+        self.assertGreater(len(messages), 1)
+        recovered = []
+        for raw in messages:
+            self.assertLessEqual(len(raw.encode('utf-8')), 2**20)
+            message = json.loads(raw)
+            self.assertEqual(message['type'], 'HISTORY')
+            recovered.extend(message['items'])
+        self.assertEqual(recovered, items)
+
+    def test_empty_snapshot_still_replies_with_history(self):
+        messages = list(server.history_messages([]))
+        self.assertEqual([json.loads(raw) for raw in messages],
+                         [{'type': 'HISTORY', 'items': []}])
+
+    def test_unicode_budget_counts_encoded_bytes_and_keeps_extra_fields(self):
+        items = [json.loads(caption(segment).payload) for segment in range(1, 8)]
+        for item in items:
+            item['text'] = '\u754c' * 100
+        with patch.object(server, 'MAX_HISTORY_MESSAGE_BYTES', 1024):
+            messages = list(server.history_messages(items))
+        self.assertGreater(len(messages), 1)
+        self.assertTrue(all(len(raw.encode('utf-8')) <= 1024 for raw in messages))
+        self.assertEqual([item for raw in messages
+                          for item in json.loads(raw)['items']], items)
+
+    def test_caption_that_fits_alone_is_not_lost_to_history_wrapper(self):
+        item = json.loads(caption(1).payload)
+        size = len(json.dumps(item, separators=(',', ':')).encode('utf-8'))
+        item['text'] += 'x' * (1024 - size)
+        with patch.object(server, 'MAX_HISTORY_MESSAGE_BYTES', 1024):
+            messages = list(server.history_messages([item]))
+        self.assertEqual(json.loads(messages[0]), {'type': 'HISTORY', 'items': []})
+        self.assertEqual(json.loads(messages[1]), item)
+        self.assertTrue(all(len(raw.encode('utf-8')) <= 1024 for raw in messages))
+
+
 class PausedClient:
     def __init__(self, fail=False):
         self.history_started = asyncio.Event()
@@ -190,6 +231,56 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
             await server.handle_client(client, {})
         self.assertNotIn(client, server.CLIENTS)
 
+    async def test_failed_live_send_closes_connection_and_finishes_handler(self):
+        class FailedLiveClient(PausedClient):
+            async def send(self, raw):
+                if json.loads(raw)['type'] == 'CAPTION_UPDATE':
+                    raise ConnectionError('live send failed')
+                await super().send(raw)
+
+        client = FailedLiveClient()
+        client.release_history.set()
+        handler = asyncio.create_task(server.handle_client(client, {}))
+        try:
+            await asyncio.wait_for(client.history_started.wait(), 1)
+            await server.ingest_caption_update(caption(1))
+            await asyncio.wait_for(asyncio.gather(handler, return_exceptions=True), 1)
+            self.assertTrue(client.finished.is_set())
+            self.assertNotIn(client, server.CLIENTS)
+        finally:
+            handler.cancel()
+            await asyncio.gather(handler, return_exceptions=True)
+
+    async def test_all_history_batches_precede_live_without_loss_or_duplicate(self):
+        for segment in range(1, 9):
+            await server.ingest_caption_update(caption(segment))
+        client = PausedClient()
+        with patch.object(server, 'MAX_HISTORY_MESSAGE_BYTES', 512):
+            handler = asyncio.create_task(server.handle_client(client, {}))
+            live = None
+            try:
+                await asyncio.wait_for(client.history_started.wait(), 1)
+                live = asyncio.create_task(server.ingest_caption_update(caption(9)))
+                await asyncio.sleep(0)
+                client.release_history.set()
+                await asyncio.wait_for(live, 1)
+                async def delivered():
+                    while not any(m.get('segment') == 9 for m in client.messages):
+                        await asyncio.sleep(0)
+                await asyncio.wait_for(delivered(), 1)
+                histories = client.messages[:-1]
+                self.assertGreater(len(histories), 1)
+                self.assertTrue(all(m['type'] == 'HISTORY' for m in histories))
+                self.assertEqual([item['segment'] for m in histories for item in m['items']],
+                                 list(range(1, 9)))
+                self.assertEqual(client.messages[-1]['segment'], 9)
+            finally:
+                handler.cancel()
+                if live is not None:
+                    live.cancel()
+                await asyncio.gather(handler, *([live] if live else []),
+                                     return_exceptions=True)
+
     async def test_hello_clamps_windows_and_defaults_invalid_fields(self):
         with patch.object(server.time, "monotonic",
                           return_value=server.time.monotonic() - 45):
@@ -209,6 +300,31 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WebSocketRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_large_history_fits_real_receiver_then_continues_live(self):
+        state = server.SessionState()
+        for segment in range(1, 20001):
+            state.apply(caption(segment, source_ts=server.time.time()))
+        with patch.object(server, 'SESSION', state), patch.object(server, 'CLIENTS', {}):
+            async with server.websockets.serve(server.handler, '127.0.0.1', 0) as listener:
+                port = listener.sockets[0].getsockname()[1]
+                async with server.websockets.connect(
+                    f'ws://127.0.0.1:{port}', max_size=2**20
+                ) as ws:
+                    await ws.send(json.dumps({'type': 'CLIENT_HELLO',
+                                              'history_seconds': 60}))
+                    recovered = []
+                    while len(recovered) < 20000:
+                        raw = await asyncio.wait_for(ws.recv(), 5)
+                        self.assertLessEqual(len(raw.encode('utf-8')), 2**20)
+                        message = json.loads(raw)
+                        self.assertEqual(message['type'], 'HISTORY')
+                        recovered.extend(item['segment'] for item in message['items'])
+                    self.assertEqual(recovered, list(range(1, 20001)))
+                    await server.ingest_caption_update(caption(20001))
+                    live = json.loads(await asyncio.wait_for(ws.recv(), 2))
+                    self.assertEqual((live['type'], live['segment']),
+                                     ('CAPTION_UPDATE', 20001))
+
     async def test_late_join_and_incremental_reconnect(self):
         async def receive(ws):
             return json.loads(await asyncio.wait_for(ws.recv(), 2))

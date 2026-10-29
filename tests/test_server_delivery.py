@@ -81,6 +81,50 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(m['segment'], m['revision']) for m in ws.messages[1:]],
                          [(s, r) for s in range(1, 5) for r in range(1, 4)])
 
+    async def test_blocked_later_history_batch_isolated_with_bounded_live_catch_up(self):
+        class PausedSecondBatch(PausedClient):
+            def __init__(self):
+                super().__init__()
+                self.release_history.set()
+                self.batches = 0
+                self.blocked = asyncio.Event()
+                self.release_second = asyncio.Event()
+
+            async def send(self, raw):
+                if json.loads(raw)['type'] == 'HISTORY':
+                    self.batches += 1
+                    if self.batches == 2:
+                        self.blocked.set()
+                        await self.release_second.wait()
+                await super().send(raw)
+
+            async def close(self, **kwargs):
+                self.release_second.set()
+                await super().close(**kwargs)
+
+        for segment in range(1, 6):
+            await server.ingest_caption_update(caption(segment))
+        slow, normal = PausedSecondBatch(), PausedClient()
+        normal.release_history.set()
+        with patch.object(server, 'MAX_HISTORY_MESSAGE_BYTES', 512):
+            client = await self.connect(slow, history_seconds=60)
+            client.MAX_PENDING = 4
+            await self.connect(normal, history_seconds=0)
+            await asyncio.wait_for(slow.blocked.wait(), 1)
+            for segment in range(6, 41):
+                await server.ingest_caption_update(caption(segment))
+                self.assertLessEqual(len(client.pending), client.MAX_PENDING)
+                self.assertLessEqual(client.pending_bytes, client.MAX_PENDING_BYTES)
+            await until(lambda: len(normal.messages) == 36)
+            self.assertEqual([m['segment'] for m in normal.messages[1:]],
+                             list(range(6, 41)))
+            self.assertTrue(client.catch_up)
+            slow.release_second.set()
+            await until(lambda: any(m.get('segment') == 40 for m in slow.messages))
+            finals = [item['segment'] for m in slow.messages
+                      for item in (m['items'] if m['type'] == 'HISTORY' else [m])]
+            self.assertEqual(finals, list(range(1, 41)))
+
     async def test_queue_limits_include_utf8_payload_bytes(self):
         ws = PausedClient()
         client = await self.connect(ws)
