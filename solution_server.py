@@ -8,7 +8,6 @@ browser/load clients works on day one.
 
 It DOES NOT implement the graded networking mechanisms:
   - revision-state management or deduplication
-  - recent-history recovery or late-join recovery
   - bounded per-client application queues
   - slow-client isolation
   - semantic coalescing / backpressure
@@ -36,6 +35,17 @@ import websockets
 # Naive global set of currently connected student clients.
 # There is deliberately no per-client queue or recovery state here.
 CLIENTS: set[Any] = set()
+
+# Finalized captions keyed by segment, used to answer HISTORY for
+# reconnecting and late-joining clients (issue #8).
+#
+# Bounded by time, not by count: clients may request at most 60 s of
+# history, so retain a little more (70 s) and evict on every ingested
+# update. The second, defensive bound drops entries whose source_ts is
+# absurdly in the future, so a broken source clock cannot keep an entry
+# alive past eviction forever.
+HISTORY_RETENTION_S = 70.0
+FINAL_HISTORY: dict[int, CaptionUpdate] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,12 +168,97 @@ def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
     )
 
 
+def evict_expired_finals() -> None:
+    """Drop finalized captions that have left the recovery window.
+
+    Called on every ingested update: the source streams continuously, so
+    the window stays current without a separate timer, and the map holds
+    only a retention window of segments, so a linear scan is cheap.
+    """
+    now = time.time()
+    for segment in list(FINAL_HISTORY):
+        source_ts = FINAL_HISTORY[segment].source_ts
+        if (source_ts <= now - HISTORY_RETENTION_S
+                or source_ts > now + HISTORY_RETENTION_S):
+            FINAL_HISTORY.pop(segment, None)
+
+
+def record_final_for_history(update: CaptionUpdate) -> None:
+    """Maintain FINAL_HISTORY for reconnect/late-join recovery (issue #8).
+
+    Only finalized captions are stored: HISTORY must contain finals only,
+    and the test harness flags any non-final item as invalid. A final is
+    durable state, so an older revision of a segment never replaces the
+    stored one (protocol invariant 1); only a strictly newer revision may
+    supersede it.
+    """
+    evict_expired_finals()
+    if not update.final:
+        return
+    stored = FINAL_HISTORY.get(update.segment)
+    if stored is not None and update.revision < stored.revision:
+        print(
+            f"ignoring older final: segment={update.segment} "
+            f"revision={update.revision} < stored {stored.revision}",
+            flush=True,
+        )
+        return
+    FINAL_HISTORY[update.segment] = update
+
+
+def _nonnegative_int(value: Any) -> int:
+    """Sanitize a CLIENT_HELLO resume field; anything junk becomes 0.
+
+    0 means "holds nothing", so a malformed resume point degrades to the
+    full recovery window instead of hiding captions from the client.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def build_history_items(hello: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build the HISTORY reply for a CLIENT_HELLO (issue #8).
+
+    Items are the finalized captions the client's reported point does not
+    already cover, oldest to newest: every segment above last_segment, plus
+    last_segment itself only when a strictly newer revision was finalized
+    after the client's last acceptance. Because delivery on one socket is
+    ordered and the client reports its newest accepted final, nothing at or
+    below the reported point is re-sent, so a final is never delivered to
+    the same client twice.
+
+    The reply is bounded by HISTORY_RETENTION_S rather than the client's
+    history_seconds: a client that missed finals older than its display
+    window keeps a low resume point and re-requests them on its next
+    reconnect, so capping the reply could cost completeness without
+    saving bandwidth.
+    """
+    last_segment = _nonnegative_int(hello.get("last_segment"))
+    last_revision = _nonnegative_int(hello.get("last_revision"))
+    items: list[dict[str, Any]] = []
+    for segment in sorted(FINAL_HISTORY):
+        update = FINAL_HISTORY[segment]
+        if segment < last_segment:
+            continue
+        if segment == last_segment and update.revision <= last_revision:
+            continue
+        # The payload is always valid JSON: the original frame parsed on
+        # ingest, or a re-serialization with defaulted fields. Items must
+        # be objects, so re-parse rather than ship the raw string.
+        items.append(json.loads(update.payload))
+    return items
+
+
 async def ingest_caption_update(update: CaptionUpdate) -> None:
     """Entry point for validated caption updates.
 
-    The session-state manager (revision dedup + broadcast policy) replaces
-    this body; ingestion/parsing above stays unchanged.
+    Finalized captions are recorded before the broadcast, so a client that
+    reconnects while this update is in flight can still recover it from
+    HISTORY. The session-state manager (revision dedup + per-client
+    queues) replaces this body later; ingestion/parsing stays unchanged.
     """
+    record_final_for_history(update)
     await broadcast_naively(update.payload)
 
 
@@ -227,10 +322,13 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
 async def handle_client(ws, hello: dict[str, Any]) -> None:
     client_id = hello.get("client_id")
 
-    # The baseline has no stored recovery state. Sending an empty HISTORY makes
-    # the connection behavior visible and keeps the starter easy to inspect.
-    # Students must implement correct HISTORY semantics for the assignment.
-    await ws.send(json.dumps({"type": "HISTORY", "items": []}))
+    # HISTORY goes out before the client joins the broadcast set, so a
+    # caption can never reach it in both the recovery burst and the live
+    # stream: the burst ends first, then live updates begin.
+    await ws.send(json.dumps({
+        "type": "HISTORY",
+        "items": build_history_items(hello),
+    }))
 
     CLIENTS.add(ws)
     print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
