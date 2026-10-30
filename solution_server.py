@@ -18,6 +18,8 @@ import argparse
 import asyncio
 import json
 import math
+import random
+import re
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -490,9 +492,18 @@ class ClientState:
     MAX_PENDING_BYTES = 256 * 1024
     LAG_SECONDS = 0.100
     RECOVER_SECONDS = 0.050
+    CHECKPOINT_SECONDS = 1.0
+    CHECKPOINT_MESSAGES = 8
+    CHECKPOINT_BYTES = 16 * 1024
+    # Allow transient receiver congestion, but do not wait for the full library
+    # keepalive cycle (up to 40 seconds) on an unanswered probe.
+    CHECKPOINT_TIMEOUT = 10.0
+    MAX_PROVISIONAL_HOLD = 1.0
+    MAX_RECOVERY_FRAGMENTS = 32
 
-    def __init__(self, ws) -> None:
+    def __init__(self, ws, *, fragment_checkpoints: bool = False) -> None:
         self.ws = ws
+        self.fragment_checkpoints = fragment_checkpoints
         self.pending: deque[tuple[CaptionUpdate, int, float, int]] = deque()
         self.pending_bytes = 0
         self.ready = asyncio.Event()
@@ -510,6 +521,132 @@ class ClientState:
         self.last_send_seconds = 0.0
         self.coalesced = 0
         self.catch_ups = 0
+        self.next_checkpoint = 0.0
+        self.checkpoint_messages = 0
+        self.checkpoint_bytes = 0
+        self.checkpoint_baseline: float | None = None
+        self.provisional_hold = 0.0
+        self.next_provisional_at = 0.0
+        self.peer_lag_until = 0.0
+        self.healthy_checkpoints = 0
+        self.healthy_since: float | None = None
+        self.recovery_window = 3 * self.CHECKPOINT_SECONDS
+        self.recovery_penalty = 1.0
+        self.last_recovery = 0.0
+        self.last_peer_delay = 0.0
+
+    def _in_probation(self, now: float) -> bool:
+        return bool(self.fragment_checkpoints and self.last_recovery
+                    and now - self.last_recovery
+                    < max(3 * self.CHECKPOINT_SECONDS, 4 * self.last_peer_delay))
+
+    def _checkpoint_due(self, size: int, now: float) -> bool:
+        return (self._in_probation(now) or now >= self.next_checkpoint
+                or self.checkpoint_messages + bool(size) >= self.CHECKPOINT_MESSAGES
+                or self.checkpoint_bytes + size >= self.CHECKPOINT_BYTES)
+
+    def _peer_lag(self, delay: float) -> None:
+        now = time.monotonic()
+        hold = delay
+        cooldown = 4 * delay
+        window = max(3 * self.CHECKPOINT_SECONDS, 2 * delay)
+        if self.fragment_checkpoints and not self.provisional_hold:
+            if self._in_probation(now):
+                self.recovery_penalty = min(4.0, 4 * self.recovery_penalty)
+            else:
+                self.recovery_penalty = 1.0
+        if self.fragment_checkpoints:
+            hold = 2 * delay
+            cooldown = self.recovery_penalty * delay if self.recovery_penalty > 1 else 0
+            window = self.CHECKPOINT_SECONDS
+        self.lagging = True
+        self.provisional_hold = max(
+            self.provisional_hold, min(self.MAX_PROVISIONAL_HOLD, hold)
+        )
+        # Repeated congestion during probation backs off; an isolated slowdown
+        # can recover without repeating a full cooldown for every hold reduction.
+        self.peer_lag_until = max(self.peer_lag_until, now + cooldown)
+        self.next_provisional_at = now + self.provisional_hold
+        self.healthy_checkpoints = 0
+        self.healthy_since = None
+        self.last_peer_delay = max(delay, self.LAG_SECONDS)
+        self.recovery_window = window
+
+    async def _checkpoint(self, size: int) -> None:
+        now = time.monotonic()
+        due = self._checkpoint_due(size, now)
+        self.checkpoint_messages += bool(size)
+        self.checkpoint_bytes += size
+        if not due:
+            return
+        # Only this connection's sole sender waits. Keep one probe outstanding;
+        # a protocol Pong is congestion feedback, not an application ACK.
+        started = now
+        pong = await self.ws.ping()
+        threshold = max(self.LAG_SECONDS, 4 * (self.checkpoint_baseline or 0))
+        if self.checkpoint_baseline is not None and not pong.done():
+            done, _ = await asyncio.wait(
+                (pong,), timeout=min(threshold, self.CHECKPOINT_TIMEOUT)
+            )
+            if not done:
+                self._peer_lag(threshold)
+        # Bound initial RTT discovery as well as live checkpoints. Leave the
+        # library-owned Pong future intact; handle_client closes on failure.
+        if not pong.done():
+            remaining = max(0.0, started + self.CHECKPOINT_TIMEOUT - time.monotonic())
+            done, _ = await asyncio.wait((pong,), timeout=remaining)
+            if not done:
+                self._peer_lag(self.CHECKPOINT_TIMEOUT)
+                self.fail("Peer checkpoint timed out; reconnect")
+                return
+        await pong
+        now = time.monotonic()
+        delay = now - started
+        if self.checkpoint_baseline is None:
+            self.checkpoint_baseline = delay
+        elif delay >= threshold:
+            self._peer_lag(delay)
+        else:
+            self.checkpoint_baseline = min(self.checkpoint_baseline, delay)
+            if (self.provisional_hold and now >= self.peer_lag_until
+                    and not self.catch_up
+                    and not any(entry[0].final for entry in self.pending)):
+                self.healthy_checkpoints += 1
+                if self.healthy_since is None:
+                    self.healthy_since = now
+                if (self.healthy_checkpoints >= 3
+                        and now - self.healthy_since >= self.recovery_window):
+                    if self.fragment_checkpoints:
+                        self.provisional_hold = 0.0
+                        self.last_recovery = now
+                    else:
+                        self.provisional_hold /= 2
+                        if self.provisional_hold < self.LAG_SECONDS:
+                            self.provisional_hold = 0.0
+                    self.healthy_checkpoints = 0
+                    self.healthy_since = None
+            elif self.provisional_hold:
+                self.healthy_checkpoints = 0
+                self.healthy_since = None
+        # Spread protocol work across clients instead of synchronizing probes
+        # on the same source revision. Count/byte bounds still cap each window.
+        interval = random.uniform(0.75, 1.25) if self.fragment_checkpoints else 1.0
+        self.next_checkpoint = now + self.CHECKPOINT_SECONDS * interval
+        self.checkpoint_messages = self.checkpoint_bytes = 0
+
+    async def _wait_provisional(self, queued_at: float) -> bool:
+        if not self.provisional_hold:
+            return False
+        delay = max(queued_at + self.provisional_hold,
+                    self.next_provisional_at) - time.monotonic()
+        if delay <= 0:
+            return False
+        self.ready.clear()
+        try:
+            await asyncio.wait_for(self.ready.wait(), delay)
+        except asyncio.TimeoutError:
+            pass
+        return True
 
     def fail(self, reason: str) -> None:
         if self.failed.is_set():
@@ -558,6 +695,12 @@ class ClientState:
         if self.catch_up:
             self.ready.set()
             return
+        queued_at = time.monotonic()
+        if self.provisional_hold:
+            # Replacements share the first pending revision's deadline, so an
+            # indefinitely revised active segment cannot postpone its own send.
+            queued_at = next((entry[2] for entry in self.pending
+                              if entry[0].segment == update.segment), queued_at)
         self._observe_lag(drop_segment=update.segment)
         sequence = SESSION.final_sequence if update.final else 0
         # Compact with the incoming frame before enforcing the hard bound.
@@ -569,7 +712,7 @@ class ClientState:
             self.catch_up = self.lagging = True
             self.catch_ups += 1
         else:
-            self.pending.append((update, size, time.monotonic(), sequence))
+            self.pending.append((update, size, queued_at, sequence))
             self.pending_bytes += size
         self.ready.set()
 
@@ -587,26 +730,42 @@ class ClientState:
             if self.sent_active.get(update.segment, 0) < update.revision:
                 return update, 0
         self.catch_up = False
-        if self.last_send_seconds < self.RECOVER_SECONDS:
+        if (not self.provisional_hold
+                and self.last_send_seconds < self.RECOVER_SECONDS):
             self.lagging = False
         return None
 
-    async def _send(self, payload: str, sequence: int = 0) -> None:
+    async def _send(self, payload: str, sequence: int = 0) -> int:
+        size = (len(payload.encode('utf-8'))
+                if isinstance(payload, str) else len(payload))
         self.send_started = time.monotonic()
         self.in_flight_sequence = sequence
         try:
-            await self.ws.send(payload)
+            if (self.fragment_checkpoints and
+                    (self.provisional_hold or self._checkpoint_due(size, self.send_started))):
+                # Frame-based peer queues then hold fewer complete captions.
+                # recv() still returns the identical single JSON message.
+                step = max(1, (len(payload) + self.MAX_RECOVERY_FRAGMENTS - 1)
+                           // self.MAX_RECOVERY_FRAGMENTS)
+                await self.ws.send(payload[i:i + step]
+                                   for i in range(0, len(payload), step))
+            else:
+                await self.ws.send(payload)
         finally:
             self.last_send_seconds = time.monotonic() - self.send_started
             self.send_started = None
             self.in_flight_sequence = 0
+        return size
 
     async def run(self, history: list[dict[str, Any]]) -> None:
+        # Establish path RTT before HISTORY can fill the peer's receive queue.
+        await self._checkpoint(0)
         for message in history_messages(history):
             self.check_recovery()
             if self.failed.is_set():
                 return
-            await self._send(message)
+            size = await self._send(message)
+            await self._checkpoint(size)
             await asyncio.sleep(0)
         del history, message
         while not self.failed.is_set():
@@ -617,19 +776,35 @@ class ClientState:
             recovery = self._next_recovery() if self.catch_up else None
             if recovery is not None:
                 update, sequence = recovery
+                if (not update.final
+                        and await self._wait_provisional(0)):
+                    continue
             elif self.pending:
-                update, size, _, sequence = self.pending.popleft()
+                if self.provisional_hold:
+                    # Finals bypass held provisionals without changing the
+                    # relative receipt order of finals from different segments.
+                    index = next((i for i, entry in enumerate(self.pending)
+                                  if entry[0].final), 0)
+                    if not self.pending[index][0].final:
+                        if await self._wait_provisional(self.pending[index][2]):
+                            continue
+                    self.pending.rotate(-index)
+                    update, size, _, sequence = self.pending.popleft()
+                    self.pending.rotate(index)
+                else:
+                    update, size, _, sequence = self.pending.popleft()
                 self.pending_bytes -= size
             else:
                 self.ready.clear()
                 await self.ready.wait()
                 continue
-            await self._send(update.payload, sequence)
+            size = await self._send(update.payload, sequence)
             if update.final:
                 self.final_cursor = sequence
                 self.sent_active.pop(update.segment, None)
             else:
                 self.sent_active[update.segment] = update.revision
+                self.next_provisional_at = time.monotonic() + self.provisional_hold
                 if len(self.sent_active) > SessionState.MAX_TRACKED_SEGMENTS:
                     active = {update.segment for update in SESSION.active_updates()}
                     self.sent_active = {
@@ -637,7 +812,9 @@ class ClientState:
                     }
             # Hysteresis: resume full coverage only with little fresh queued work
             # and a fast completed send. Keep a single stalled send per client.
-            if (not self.catch_up and len(self.pending) <= self.MAX_PENDING // 4
+            await self._checkpoint(size)
+            if (not self.provisional_hold and not self.catch_up
+                    and len(self.pending) <= self.MAX_PENDING // 4
                     and self.pending_bytes <= self.MAX_PENDING_BYTES // 4
                     and self.last_send_seconds < self.RECOVER_SECONDS
                     and (not self.pending or time.monotonic() - self.pending[0][2]
@@ -706,7 +883,15 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
     # Snapshot and registration are synchronous. The sender owns HISTORY and
     # every subsequent live send; source ingestion never waits for either.
     items = SESSION.history_items(last_segment, last_revision, seconds)
-    client = ClientState(ws)
+    # Older Python websockets receivers can crash when recv() times out during
+    # fragmentation (upstream #1773, fixed in 17.3). This advisory compatibility
+    # guard is not authentication: absent/unknown UAs use the plain-frame policy.
+    request = getattr(ws, 'request', None)
+    headers = request.headers if request is not None else getattr(ws, 'request_headers', {})
+    version = re.search(r'(?:^| )websockets/(\d{1,3})\.(\d{1,3})(?:\.\d{1,3})?(?: |$)',
+                        headers.get('User-Agent', ''))
+    fragment_checkpoints = bool(version and tuple(map(int, version.groups())) >= (17, 3))
+    client = ClientState(ws, fragment_checkpoints=fragment_checkpoints)
     CLIENTS[ws] = client
     sender = asyncio.create_task(client.run(items))
     del items
