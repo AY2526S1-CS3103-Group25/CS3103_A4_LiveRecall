@@ -1,2 +1,4 @@
 # Mandatory deterministic path only.
-websockets>=13,<17
+# 17.3 fixes fragmented recv() cancellation; Python 3.10 uses safe plain frames.
+websockets>=17.3,<18; python_version >= "3.11"
+websockets>=13,<17; python_version < "3.11"

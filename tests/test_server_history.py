@@ -163,6 +163,10 @@ class HistoryMessageTests(unittest.TestCase):
         self.assertTrue(all(len(raw.encode('utf-8')) <= 1024 for raw in messages))
 
 
+def reassemble(raw):
+    return raw if isinstance(raw, (str, bytes)) else ''.join(raw)
+
+
 class PausedClient:
     def __init__(self, fail=False):
         self.history_started = asyncio.Event()
@@ -172,6 +176,7 @@ class PausedClient:
         self.fail = fail
 
     async def send(self, raw):
+        raw = reassemble(raw)
         msg = json.loads(raw)
         if msg["type"] == "HISTORY":
             self.history_started.set()
@@ -179,6 +184,11 @@ class PausedClient:
             if self.fail:
                 raise ConnectionError("client disconnected during history")
         self.messages.append(msg)
+
+    async def ping(self):
+        pong = asyncio.get_running_loop().create_future()
+        pong.set_result(0.0)
+        return pong
 
     async def close(self, **kwargs):
         self.release_history.set()
@@ -234,6 +244,7 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_live_send_closes_connection_and_finishes_handler(self):
         class FailedLiveClient(PausedClient):
             async def send(self, raw):
+                raw = reassemble(raw)
                 if json.loads(raw)['type'] == 'CAPTION_UPDATE':
                     raise ConnectionError('live send failed')
                 await super().send(raw)

@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 import solution_server as server
-from test_server_history import PausedClient, caption
+from test_server_history import PausedClient, caption, reassemble
 
 
 async def until(predicate):
@@ -25,6 +25,7 @@ class PausedLiveClient(PausedClient):
         self.release_live = asyncio.Event()
 
     async def send(self, raw):
+        raw = reassemble(raw)
         if json.loads(raw)['type'] == 'CAPTION_UPDATE' and not self.live_started.is_set():
             self.live_started.set()
             await self.release_live.wait()
@@ -32,6 +33,27 @@ class PausedLiveClient(PausedClient):
 
     async def close(self, **kwargs):
         self.release_live.set()
+        await super().close(**kwargs)
+
+
+class PausedPongClient(PausedClient):
+    def __init__(self):
+        super().__init__()
+        self.release_history.set()
+        self.pause_pongs = False
+        self.pong_started = asyncio.Event()
+        self.pong = None
+
+    async def ping(self):
+        if not self.pause_pongs:
+            return await super().ping()
+        self.pong = asyncio.get_running_loop().create_future()
+        self.pong_started.set()
+        return self.pong
+
+    async def close(self, **kwargs):
+        if self.pong is not None and not self.pong.done():
+            self.pong.cancel()
         await super().close(**kwargs)
 
 
@@ -81,6 +103,260 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(m['segment'], m['revision']) for m in ws.messages[1:]],
                          [(s, r) for s in range(1, 5) for r in range(1, 4)])
 
+    async def test_delayed_pong_isolated_and_sent_final_cursor_already_advanced(self):
+        slow, normal = PausedPongClient(), PausedClient()
+        slow.request_headers = {'User-Agent': 'Python/3.11 websockets/17.3'}
+        normal.release_history.set()
+        client = await self.connect(slow)
+        await self.connect(normal)
+        await until(lambda: len(slow.messages) == 1)
+        client.next_checkpoint = 0
+        slow.pause_pongs = True
+        await server.ingest_caption_update(caption(1))
+        await slow.pong_started.wait()
+        self.assertEqual(client.final_cursor, 1)
+        for segment in range(2, 7):
+            await server.ingest_caption_update(caption(segment))
+        await until(lambda: len(normal.messages) == 7)
+        await until(lambda: client.provisional_hold > 0)
+        slow.pause_pongs = False
+        slow.pong.set_result(0)
+        await until(lambda: len(slow.messages) == 7)
+        self.assertEqual([m['segment'] for m in slow.messages[1:]], list(range(1, 7)))
+        self.assertTrue(client.lagging)
+        self.assertGreater(client.provisional_hold, 0)
+
+    async def test_final_supersedes_held_provisionals_without_waiting_for_deadline(self):
+        ws = PausedPongClient()
+        ws.request_headers = {'User-Agent': 'Python/3.11 websockets/17.3'}
+        client = await self.connect(ws)
+        await until(lambda: len(ws.messages) == 1)
+        client._peer_lag(1)
+        await server.ingest_caption_update(caption(1, 1, False))
+        await asyncio.sleep(0)
+        await server.ingest_caption_update(caption(1, 2, False))
+        self.assertEqual(len(ws.messages), 1)
+        await server.ingest_caption_update(caption(1, 3, True))
+        await until(lambda: len(ws.messages) == 2)
+        self.assertEqual((ws.messages[-1]['revision'], ws.messages[-1]['final']), (3, True))
+
+    async def test_held_active_revision_delivered_without_further_source_input(self):
+        ws = PausedPongClient()
+        ws.request_headers = {'User-Agent': 'Python/3.11 websockets/17.3'}
+        client = await self.connect(ws)
+        await until(lambda: len(ws.messages) == 1)
+        client._peer_lag(0.03)
+        await server.ingest_caption_update(caption(1, 1, False))
+        first_deadline = client.pending[0][2]
+        await server.ingest_caption_update(caption(1, 2, False))
+        self.assertEqual(client.pending[0][2], first_deadline)
+        await until(lambda: len(ws.messages) == 2)
+        self.assertEqual(ws.messages[-1]['revision'], 2)
+
+    async def test_finals_bypass_a_different_held_active_segment_in_receipt_order(self):
+        ws = PausedPongClient()
+        ws.request_headers = {'User-Agent': 'Python/3.11 websockets/17.3'}
+        client = await self.connect(ws)
+        await until(lambda: len(ws.messages) == 1)
+        client._peer_lag(1)
+        await server.ingest_caption_update(caption(1, final=False))
+        await asyncio.sleep(0)
+        await server.ingest_caption_update(caption(3))
+        await server.ingest_caption_update(caption(2))
+        await until(lambda: len(ws.messages) == 3)
+        self.assertEqual([m['segment'] for m in ws.messages[1:]], [3, 2])
+        self.assertEqual([entry[0].segment for entry in client.pending], [1])
+        client.provisional_hold = 0
+        client.ready.set()
+        await until(lambda: len(ws.messages) == 4)
+        self.assertEqual(ws.messages[-1]['segment'], 1)
+
+    async def test_sent_final_can_expire_while_waiting_for_pong_without_replay(self):
+        ws = PausedPongClient()
+        client = await self.connect(ws)
+        await until(lambda: len(ws.messages) == 1)
+        client.MAX_PENDING = 1
+        client.next_checkpoint = 0
+        ws.pause_pongs = True
+        now = server.time.monotonic()
+        with patch.object(server.time, 'monotonic', return_value=now - 71):
+            await server.ingest_caption_update(caption(1))
+        await ws.pong_started.wait()
+        server.SESSION.prune_history()
+        for segment in range(2, 5):
+            await server.ingest_caption_update(caption(segment))
+        self.assertTrue(client.catch_up)
+        self.assertEqual(server.SESSION.expired_sequence, 1)
+        self.assertEqual(client.final_cursor, 1)
+        self.assertFalse(client.failed.is_set())
+        ws.pause_pongs = False
+        ws.pong.set_result(0)
+        await until(lambda: len(ws.messages) == 5)
+        self.assertEqual([m['segment'] for m in ws.messages[1:]], [1, 2, 3, 4])
+
+    async def test_initial_path_rtt_is_measured_before_classifying_congestion(self):
+        ws = PausedPongClient()
+        ws.pause_pongs = True
+        client = server.ClientState(ws)
+        client.LAG_SECONDS = 0.001
+        checkpoint = asyncio.create_task(client._checkpoint(0))
+        try:
+            await ws.pong_started.wait()
+            await asyncio.sleep(0.01)
+            ws.pong.set_result(0)
+            await checkpoint
+            self.assertGreater(client.checkpoint_baseline, client.LAG_SECONDS)
+            self.assertEqual(client.provisional_hold, 0)
+        finally:
+            await ws.close()
+            checkpoint.cancel()
+            await asyncio.gather(checkpoint, return_exceptions=True)
+
+    async def test_peer_lag_hysteresis_requires_sustained_healthy_checkpoints(self):
+        client = server.ClientState(PausedClient(), fragment_checkpoints=True)
+        await client._checkpoint(0)
+        client._peer_lag(0.4)
+        hold = client.provisional_hold
+        async def checkpoint():
+            client.next_checkpoint = 0
+            await client._checkpoint(1)
+        # A few immediate checkpoints don't demonstrate sustained recovery.
+        for _ in range(4):
+            await checkpoint()
+        self.assertEqual(client.provisional_hold, hold)
+        client.peer_lag_until = 0
+        for _ in range(2):
+            await checkpoint()
+        self.assertEqual(client.provisional_hold, hold)
+        for _ in range(3):
+            await checkpoint()
+        self.assertEqual(client.provisional_hold, hold)
+        client.healthy_since -= client.recovery_window
+        await checkpoint()
+        self.assertEqual(client.provisional_hold, 0)
+        self.assertGreater(client.last_recovery, 0)
+        client._peer_lag(0.4)
+        self.assertEqual(client.recovery_penalty, 4)
+        self.assertGreater(client.provisional_hold, 0)
+
+    async def test_closing_during_checkpoint_releases_pending_pong(self):
+        ws = PausedPongClient()
+        client = await self.connect(ws)
+        await until(lambda: len(ws.messages) == 1)
+        client.next_checkpoint = 0
+        ws.pause_pongs = True
+        await server.ingest_caption_update(caption(1))
+        await ws.pong_started.wait()
+        await ws.close()
+        await until(lambda: ws not in server.CLIENTS)
+        self.assertTrue(ws.pong.done())
+
+    async def test_probation_checks_each_message_before_resuming_periodic_probes(self):
+        ws = PausedClient()
+        client = server.ClientState(ws, fragment_checkpoints=True)
+        await client._checkpoint(0)
+        client.last_recovery = server.time.monotonic()
+        client.last_peer_delay = 1
+        client.next_checkpoint = server.time.monotonic() + 100
+        with patch.object(ws, 'ping', wraps=ws.ping) as ping:
+            await client._checkpoint(1)
+            self.assertEqual(ping.await_count, 1)
+            client.last_recovery -= 10
+            client.next_checkpoint = server.time.monotonic() + 100
+            await client._checkpoint(1)
+            self.assertEqual(ping.await_count, 1)
+
+    async def test_relapse_backoff_is_bounded_and_resets_after_stable_full_delivery(self):
+        client = server.ClientState(PausedClient(), fragment_checkpoints=True)
+        for _ in range(6):
+            client.provisional_hold = 0
+            client.last_recovery = server.time.monotonic()
+            client.last_peer_delay = 1
+            client._peer_lag(1)
+        self.assertEqual(client.recovery_penalty, 4)
+        client.provisional_hold = 0
+        client.last_recovery -= 10
+        client._peer_lag(1)
+        self.assertEqual(client.recovery_penalty, 1)
+
+    async def test_recovery_fragments_reassemble_identical_unicode_json(self):
+        async with server.websockets.serve(server.handler, '127.0.0.1', 0) as listener:
+            uri = f'ws://127.0.0.1:{listener.sockets[0].getsockname()[1]}'
+            async with server.websockets.connect(uri, max_size=2**20) as ws:
+                await ws.send(json.dumps(dict(type='CLIENT_HELLO', history_seconds=0)))
+                self.assertEqual(json.loads(await ws.recv())['type'], 'HISTORY')
+                client = next(iter(server.CLIENTS.values()))
+                fixed_receiver = tuple(map(int, server.websockets.__version__.split('.')[:2])) >= (17, 3)
+                self.assertEqual(client.fragment_checkpoints, fixed_receiver)
+                client.fragment_checkpoints = True
+                client._peer_lag(0.2)
+                msg = json.loads(caption(1).payload)
+                msg['text'] = '\u754c\U0001f642' * 1000
+                raw = json.dumps(msg, ensure_ascii=False)
+                await server.ingest_caption_update(server.parse_caption_update(msg, raw))
+                fragments = [part async for part in ws.recv_streaming()]
+                self.assertGreater(len(fragments), 1)
+                self.assertEqual(''.join(fragments), raw)
+                client.provisional_hold = 0
+                client.last_recovery = 0
+                client.lagging = False
+                await server.ingest_caption_update(caption(2))
+                fragments = [part async for part in ws.recv_streaming()]
+                self.assertEqual(len(fragments), 1)
+                self.assertEqual(json.loads(fragments[0])['segment'], 2)
+                client.next_checkpoint = 0
+                await server.ingest_caption_update(caption(3))
+                fragments = [part async for part in ws.recv_streaming()]
+                self.assertGreater(len(fragments), 1)
+                self.assertEqual(json.loads(''.join(fragments))['segment'], 3)
+
+    async def test_checkpoint_count_and_byte_caps_override_periodic_deadline(self):
+        ws = PausedClient()
+        client = server.ClientState(ws)
+        with patch.object(ws, 'ping', wraps=ws.ping) as ping:
+            await client._checkpoint(0)
+            client.next_checkpoint = server.time.monotonic() + 100
+            for _ in range(client.CHECKPOINT_MESSAGES - 1):
+                await client._checkpoint(1)
+            self.assertEqual(ping.await_count, 1)
+            await client._checkpoint(1)
+            self.assertEqual(ping.await_count, 2)
+            client.next_checkpoint = server.time.monotonic() + 100
+            await client._checkpoint(client.CHECKPOINT_BYTES)
+            self.assertEqual(ping.await_count, 3)
+
+    async def test_fragmentation_is_gated_by_fixed_receiver_version(self):
+        for agent, enabled in [
+            ('Python/3.11 websockets/16.1.1', False),
+            ('Python/3.11 websockets/17.2', False),
+            ('Python/3.11 websockets/17.3', True),
+            ('Python/3.11 websockets/17.3.1', True),
+            ('Python/3.11 websockets/17.3rc1', False),
+            ('Mozilla/5.0', False),
+        ]:
+            with self.subTest(agent=agent):
+                ws = PausedClient()
+                ws.request_headers = {'User-Agent': agent}
+                ws.release_history.set()
+                client = await self.connect(ws)
+                self.assertEqual(client.fragment_checkpoints, enabled)
+
+    async def test_older_receivers_keep_unfragmented_gradual_recovery(self):
+        ws = PausedClient()
+        client = server.ClientState(ws)
+        await client._checkpoint(0)
+        client._peer_lag(0.4)
+        self.assertEqual(client.provisional_hold, 0.4)
+        client.next_checkpoint = 0
+        with patch.object(ws, 'send', wraps=ws.send) as send:
+            await client._send(caption(1).payload)
+            self.assertIsInstance(send.call_args.args[0], str)
+        client.peer_lag_until = 0
+        client.healthy_since = server.time.monotonic() - client.recovery_window
+        client.healthy_checkpoints = 2
+        await client._checkpoint(1)
+        self.assertEqual(client.provisional_hold, 0.2)
+
     async def test_blocked_later_history_batch_isolated_with_bounded_live_catch_up(self):
         class PausedSecondBatch(PausedClient):
             def __init__(self):
@@ -91,6 +367,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 self.release_second = asyncio.Event()
 
             async def send(self, raw):
+                raw = reassemble(raw)
                 if json.loads(raw)['type'] == 'HISTORY':
                     self.batches += 1
                     if self.batches == 2:
