@@ -77,6 +77,9 @@ See `PROTOCOL_EXAMPLES.md` for worked message exchanges.
   `./venv/bin/pip install -r requirements.txt`,
   `./venv/bin/python solution_server.py --port 8765`.
 - Sanity check: `python submission_check.py` (verifies required files and startup).
+- Server regressions (from the repository root):
+  `./venv/bin/python -m unittest discover -s tests -p 'test_*.py'`.
+- Client regressions: `node --test tests/*.cjs`.
 - Public tests (run each ≥ 3 times, report the median):
   - T1: `python run_demo.py --clients 20 --duration 20 --runs 3`
   - T2: `python run_demo.py --clients 100 --duration 40 --runs 3`
