@@ -126,6 +126,53 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(client.lagging)
         self.assertGreater(client.provisional_hold, 0)
 
+    async def test_missing_initial_pong_closes_without_blocking_normal_delivery(self):
+        slow, normal = PausedPongClient(), PausedClient()
+        slow.pause_pongs = True
+        normal.release_history.set()
+        with patch.object(server.ClientState, 'CHECKPOINT_TIMEOUT', 0.03):
+            client = await self.connect(slow)
+            await self.connect(normal)
+            await slow.pong_started.wait()
+            await server.ingest_caption_update(caption(1))
+            await until(lambda: len(normal.messages) == 2)
+            await asyncio.wait_for(self.handlers[0], 1)
+        self.assertEqual(slow.messages, [])
+        self.assertEqual(client.failure_reason, 'Peer checkpoint timed out; reconnect')
+        self.assertNotIn(slow, server.CLIENTS)
+        self.assertTrue(slow.pong.cancelled())
+
+    async def test_missing_live_pong_closes_with_sent_final_cursor_preserved(self):
+        ws = PausedPongClient()
+        client = await self.connect(ws)
+        await until(lambda: len(ws.messages) == 1)
+        client.CHECKPOINT_TIMEOUT = 0.03
+        # A large RTT baseline must not extend the hard checkpoint deadline.
+        client.checkpoint_baseline = 10
+        client.next_checkpoint = 0
+        ws.pause_pongs = True
+        await server.ingest_caption_update(caption(1))
+        await ws.pong_started.wait()
+        await server.ingest_caption_update(caption(2))
+        await asyncio.wait_for(self.handlers[0], 1)
+        self.assertEqual(client.final_cursor, 1)
+        self.assertEqual([m['segment'] for m in ws.messages[1:]], [1])
+        self.assertEqual(client.failure_reason, 'Peer checkpoint timed out; reconnect')
+        self.assertTrue(ws.pong.cancelled())
+
+    async def test_connection_closed_during_pong_finishes_handler(self):
+        ws = PausedPongClient()
+        client = await self.connect(ws)
+        await until(lambda: len(ws.messages) == 1)
+        client.next_checkpoint = 0
+        ws.pause_pongs = True
+        await server.ingest_caption_update(caption(1))
+        await ws.pong_started.wait()
+        ws.pong.set_exception(server.ConnectionClosed(None, None))
+        await asyncio.wait_for(self.handlers[0], 1)
+        self.assertNotIn(ws, server.CLIENTS)
+        self.assertTrue(ws.finished.is_set())
+
     async def test_final_supersedes_held_provisionals_without_waiting_for_deadline(self):
         ws = PausedPongClient()
         ws.request_headers = {'User-Agent': 'Python/3.11 websockets/17.3'}
@@ -333,10 +380,12 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             ('Python/3.11 websockets/17.3.1', True),
             ('Python/3.11 websockets/17.3rc1', False),
             ('Mozilla/5.0', False),
+            ('', False),
+            (None, False),
         ]:
             with self.subTest(agent=agent):
                 ws = PausedClient()
-                ws.request_headers = {'User-Agent': agent}
+                ws.request_headers = {} if agent is None else {'User-Agent': agent}
                 ws.release_history.set()
                 client = await self.connect(ws)
                 self.assertEqual(client.fragment_checkpoints, enabled)

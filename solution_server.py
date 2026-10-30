@@ -495,6 +495,9 @@ class ClientState:
     CHECKPOINT_SECONDS = 1.0
     CHECKPOINT_MESSAGES = 8
     CHECKPOINT_BYTES = 16 * 1024
+    # Allow transient receiver congestion, but do not wait for the full library
+    # keepalive cycle (up to 40 seconds) on an unanswered probe.
+    CHECKPOINT_TIMEOUT = 10.0
     MAX_PROVISIONAL_HOLD = 1.0
     MAX_RECOVERY_FRAGMENTS = 32
 
@@ -582,9 +585,20 @@ class ClientState:
         pong = await self.ws.ping()
         threshold = max(self.LAG_SECONDS, 4 * (self.checkpoint_baseline or 0))
         if self.checkpoint_baseline is not None and not pong.done():
-            done, _ = await asyncio.wait((pong,), timeout=threshold)
+            done, _ = await asyncio.wait(
+                (pong,), timeout=min(threshold, self.CHECKPOINT_TIMEOUT)
+            )
             if not done:
                 self._peer_lag(threshold)
+        # Bound initial RTT discovery as well as live checkpoints. Leave the
+        # library-owned Pong future intact; handle_client closes on failure.
+        if not pong.done():
+            remaining = max(0.0, started + self.CHECKPOINT_TIMEOUT - time.monotonic())
+            done, _ = await asyncio.wait((pong,), timeout=remaining)
+            if not done:
+                self._peer_lag(self.CHECKPOINT_TIMEOUT)
+                self.fail("Peer checkpoint timed out; reconnect")
+                return
         await pong
         now = time.monotonic()
         delay = now - started
@@ -870,7 +884,8 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
     # every subsequent live send; source ingestion never waits for either.
     items = SESSION.history_items(last_segment, last_revision, seconds)
     # Older Python websockets receivers can crash when recv() times out during
-    # fragmentation (upstream #1773, fixed in 17.3). Unknown peers stay compatible.
+    # fragmentation (upstream #1773, fixed in 17.3). This advisory compatibility
+    # guard is not authentication: absent/unknown UAs use the plain-frame policy.
     request = getattr(ws, 'request', None)
     headers = request.headers if request is not None else getattr(ws, 'request_headers', {})
     version = re.search(r'(?:^| )websockets/(\d{1,3})\.(\d{1,3})(?:\.\d{1,3})?(?: |$)',
