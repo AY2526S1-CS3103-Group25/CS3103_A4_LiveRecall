@@ -38,9 +38,9 @@ class CaptionUpdate:
     """A validated CAPTION_UPDATE.
 
     `payload` is the JSON string forwarded to clients: the original frame
-    as received (byte-exact, extra fields preserved) unless a lenient field
-    (`source_ts`, `text`) had to be defaulted, in which case it is a
-    re-serialization of the frame with the defaults filled in.
+    as received (extra fields preserved) unless a lenient field or non-finite
+    number had to be normalized. Binary UTF-8 frames are decoded to text so
+    browser clients receive JSON text frames rather than Blob objects.
     """
 
     segment: int
@@ -349,23 +349,39 @@ def _finite_float(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _decode_source_frame(raw: str | bytes) -> tuple[Any, str | bytes]:
+def _decode_source_frame(raw: str | bytes) -> tuple[Any, str]:
     """Decode a source frame into (message, payload to forward).
 
     `json.loads` accepts the JavaScript-only `NaN`/`Infinity`/`-Infinity`
     literals and `json.dumps` re-emits them, but they are not valid JSON:
     a browser's `JSON.parse` rejects the entire frame, so a caption carrying
     one in any field — including an unknown extra one we never look at —
-    would be lost. When such a literal is seen it is replaced with null and
-    the payload re-serialized. `parse_constant` fires only in that case, so
-    ordinary frames keep their byte-exact payload and pay nothing.
+    would be lost. Large exponents such as 1e400 also decode to infinity in
+    Python and can become invalid JSON when another field is patched. Both
+    cases are replaced with null before re-serialization. Ordinary text frames
+    retain their original payload.
     """
+    if isinstance(raw, bytes):
+        # Keep the decoder's existing acceptance of a UTF-8 BOM.
+        raw = raw.decode("utf-8-sig")
     seen: list[str] = []
-    msg = json.loads(raw, parse_constant=lambda name: seen.append(name) or None)
+
+    def parse_float(token: str) -> float | None:
+        number = float(token)
+        if math.isfinite(number):
+            return number
+        seen.append("overflowing number")
+        return None
+
+    msg = json.loads(
+        raw,
+        parse_constant=lambda name: seen.append(name) or None,
+        parse_float=parse_float,
+    )
     if not seen:
         return msg, raw
-    print(f"rewrote non-JSON literal(s) to null: {', '.join(seen)}", flush=True)
-    return msg, json.dumps(msg)
+    print(f"rewrote non-finite number(s) to null: {', '.join(seen)}", flush=True)
+    return msg, json.dumps(msg, allow_nan=False)
 
 
 def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:

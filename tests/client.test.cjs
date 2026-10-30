@@ -8,16 +8,34 @@ function client() {
   function element() {
     return {
       children: [], dataset: {}, textContent: "", hidden: false, style: {},
+      attributes: {}, scrollTop: 0, scrollHeight: 0, listeners: {},
+      addEventListener(type, listener) { this.listeners[type] = listener; },
+      setAttribute(name, value) { this.attributes[name] = String(value); },
+      getAttribute(name) { return this.attributes[name]; },
+      appendChild(row) { this.insertBefore(row, null); },
       insertBefore(row, next) {
         const index = next ? this.children.indexOf(next) : this.children.length;
         this.children.splice(index, 0, row);
         row.remove = () => this.children.splice(this.children.indexOf(row), 1);
+      },
+      replaceChildren(...nodes) {
+        this.children = nodes.flatMap(node => node.isFragment ? node.children : [node]);
+        for (const row of this.children) {
+          row.remove = () => this.children.splice(this.children.indexOf(row), 1);
+        }
       }
     };
   }
   const elements = Object.fromEntries(
-    ["status", "live", "live-empty", "recall"].map(id => [id, element()])
+    ["status", "live", "live-empty", "recall", "recall-heading", "recall-empty"]
+      .map(id => [id, element()])
   );
+  const recallButtons = [30, 15, 60].map(seconds => {
+    const button = element();
+    button.dataset.seconds = String(seconds);
+    button.textContent = seconds === 30 ? "What did I miss? (30 s)" : `${seconds} s`;
+    return button;
+  });
   elements["live-empty"].textContent = "Waiting for captions.";
   let now = 0;
   let cleanup;
@@ -45,7 +63,8 @@ function client() {
     document: {
       getElementById: id => elements[id],
       createElement: element,
-      querySelectorAll: () => []
+      createDocumentFragment: () => ({ ...element(), isFragment: true }),
+      querySelectorAll: selector => selector === "button[data-seconds]" ? recallButtons : []
     },
     performance: { now: () => now },
     setInterval: (callback, delay) => { cleanup = callback; interval = delay; },
