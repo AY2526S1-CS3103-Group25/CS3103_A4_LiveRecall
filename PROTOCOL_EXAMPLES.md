@@ -50,3 +50,17 @@ A brand-new client uses:
 ```
 
 The server provides recent finalized context available inside the bounded history window, then the client continues with live updates.
+
+## 4. Large recovery windows (server extension)
+
+The server normally replies with one HISTORY message. If the selected snapshot
+would exceed the load client's 1 MiB receive limit, it sends successive HISTORY
+messages, each within that limit. Items stay in segment order across batches;
+clients merge each batch rather than replacing the previous batch. No retained
+final is discarded to make the snapshot fit one message.
+
+A single caption may fit the receive limit while its HISTORY wrapper would not.
+In that case it uses the existing CAPTION_UPDATE format during recovery, after
+an initial HISTORY reply. Both paths use the same revision/final deduplication
+rules. The complete recovery snapshot precedes updates accepted after the hello.
+The server's 70-second retention window and resume-cursor filtering are unchanged.

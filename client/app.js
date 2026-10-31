@@ -1,6 +1,6 @@
 /*
- * LiveRecall browser client: live revision display (issue #3) and
- * automatic reconnect with visible connection state (issue #4).
+ * LiveRecall browser client: live revision display, local recall, and
+ * automatic reconnect with visible connection state.
  *
  * Implemented behavior:
  *   - opens a WebSocket
@@ -8,11 +8,12 @@
  *   - replaces accepted revisions in the same caption row
  *   - distinguishes provisional/final captions and protects finalized text
  *   - removes expired finals and abandoned provisional rows
+ *   - recalls 15/30/60 seconds of locally received finalized captions
  *   - reconnects automatically with backoff and reports connection state
  *   - merges HISTORY recovery bursts without duplicating finalized captions
  *
  * Graded TODOs:
- *   - implement 30 s default recall + 15/30/60 s views
+ *   - HISTORY merge/deduplication
  *   - usable final UI
  */
 
@@ -28,6 +29,11 @@ const statusEl = document.getElementById("status");
 const liveEl = document.getElementById("live");
 const liveEmptyEl = document.getElementById("live-empty");
 const recallEl = document.getElementById("recall");
+const recallHeadingEl = document.getElementById("recall-heading");
+const recallEmptyEl = document.getElementById("recall-empty");
+const recallButtons = Array.from(document.querySelectorAll("button[data-seconds]"));
+let recallSeconds = 30;
+let renderedRecallEntries = null;
 
 // One accepted caption and DOM row per segment in the single L1 session.
 const captionsBySegment = new Map();
@@ -42,14 +48,43 @@ let latestSegment = 0;
 // skip everything at or below the reported point, so a mark that jumps over a
 // segment we never got would make that segment unreachable.
 // pendingFinals holds finals parked *above* a gap (the missing segment just
-// past the run head). Live delivery is ordered, so a gap only survives when a
-// final is missed (e.g. during a disconnect) and never refilled; once the gap
-// is older than the local retention window, pruneExpiredCaptions abandons it,
-// so the map and the reported resume point stay bounded.
-const pendingFinals = new Map(); // segment -> revision of held, not-yet-contiguous finals
+// past the run head). Each entry keeps the time it was parked:
+//   - an entry older than the local retention window is dropped on its own
+//     age (its final is past the 60 s this client displays and past the
+//     server's window too), which alone bounds the map to one window of the
+//     stream even when gaps recur;
+//   - the gap itself is abandoned once its own age passes the window, using
+//     real observation times only. The age is never reset to "now" for
+//     already-old gaps, so recurring gaps cannot restart the retention
+//     period and drag the head further behind.
+const pendingFinals = new Map(); // segment -> { revision, parkedAt }
 let contiguousFinal = { segment: 0, revision: 0 };
 let sawFirstFinal = false;
-let gapSince = 0; // when the missing segment just past the run head was first observed
+// When the missing segment just past the run head was first observed (set
+// only from real observation times; 0 means no gap is currently observed).
+let gapSince = 0;
+
+function minParkedAt() {
+  // The gap's age is the age of its first observable evidence: the oldest
+  // parked entry above it. All parked entries sit above the current gap.
+  let min = Infinity;
+  for (const held of pendingFinals.values()) {
+    if (held.parkedAt < min) min = held.parkedAt;
+  }
+  return min;
+}
+
+function oldestParked() {
+  let segment = 0;
+  let entry = null;
+  for (const [seg, held] of pendingFinals) {
+    if (entry === null || seg < segment) {
+      segment = seg;
+      entry = held;
+    }
+  }
+  return entry === null ? null : { segment, entry };
+}
 
 function recordFinalForResume(segment, revision) {
   if (!sawFirstFinal) {
@@ -66,33 +101,45 @@ function recordFinalForResume(segment, revision) {
     // Fold in any higher finals already held, in order.
     while (pendingFinals.has(contiguousFinal.segment + 1)) {
       const next = contiguousFinal.segment + 1;
-      contiguousFinal = { segment: next, revision: pendingFinals.get(next) };
+      contiguousFinal = { segment: next, revision: pendingFinals.get(next).revision };
       pendingFinals.delete(next);
     }
-    // The run moved: any remaining gap is a fresh one, so re-age it from now.
-    gapSince = pendingFinals.size === 0 ? 0 : performance.now();
+    // The run moved: any remaining gap was first observed when its oldest
+    // parked entry was parked, so keep that real age rather than re-aging it.
+    gapSince = pendingFinals.size === 0 ? 0 : minParkedAt();
   } else {
     // Gap above the head: hold the final until (if ever) the missing segment
     // arrives; the resume report stays at the run head meanwhile.
     if (gapSince === 0) gapSince = performance.now();
-    pendingFinals.set(segment, revision);
+    pendingFinals.set(segment, { revision, parkedAt: performance.now() });
   }
 }
 
 let ws;
+let clientId;
 // Reconnect bookkeeping. The timer is cleared before each new dial so a
-// stale schedule can never open a duplicate connection.
+// stale schedule can never open a duplicate connection. openedAt is the
+// time of the last successful open (-1 if the current socket never opened),
+// so a connection must actually survive before it may reset the backoff.
 let reconnectAttempts = 0;
 let reconnectTimer = null;
+let openedAt = -1;
 
 function numericClientId() {
+  if (clientId !== undefined) return clientId;
   const key = "liverecall-client-id";
-  let value = sessionStorage.getItem(key);
-  if (!value) {
-    value = String(Math.floor(100000 + Math.random() * 900000));
-    sessionStorage.setItem(key, value);
+  clientId = Math.floor(100000 + Math.random() * 900000);
+  try {
+    const stored = Number(sessionStorage.getItem(key));
+    if (Number.isSafeInteger(stored) && stored > 0) {
+      clientId = stored;
+    } else {
+      sessionStorage.setItem(key, String(clientId));
+    }
+  } catch {
+    // Storage may be blocked. Keep one in-memory ID so hello still succeeds.
   }
-  return Number(value);
+  return clientId;
 }
 
 function renderCaption(row, msg, stale = false) {
@@ -112,6 +159,49 @@ function updateEmptyState() {
   if (liveEmptyEl.textContent !== message) liveEmptyEl.textContent = message;
 }
 
+function renderRecall() {
+  // The user chose client receipt time for recall, not source_ts. An accepted
+  // final's lastUpdatedAt never changes, so duplicates cannot extend its window.
+  const cutoff = performance.now() - recallSeconds * 1000;
+  const finals = Array.from(captionsBySegment.values())
+    .filter(entry => entry.caption.final && entry.lastUpdatedAt >= cutoff)
+    .sort((a, b) => a.caption.segment - b.caption.segment);
+  recallEl.hidden = finals.length === 0;
+  recallEmptyEl.hidden = finals.length > 0;
+  const message = `No finalized captions in the previous ${recallSeconds} seconds.`;
+  if (recallEmptyEl.textContent !== message) recallEmptyEl.textContent = message;
+
+  // Accepted finals are immutable. Keep their DOM nodes when the ordered
+  // entries are unchanged, preserving selection across idle cleanup ticks.
+  if (renderedRecallEntries && finals.length === renderedRecallEntries.length &&
+      finals.every((entry, index) => entry === renderedRecallEntries[index])) return;
+
+  const fragment = document.createDocumentFragment();
+  for (const entry of finals) {
+    // Separate rows leave the live pane intact; source text stays plain text.
+    const row = document.createElement("div");
+    row.dataset.segment = String(entry.caption.segment);
+    renderCaption(row, entry.caption);
+    fragment.appendChild(row);
+  }
+  const scrollTop = recallEl.scrollTop;
+  // One argument avoids the JavaScript argument limit for large local windows.
+  recallEl.replaceChildren(fragment);
+  recallEl.scrollTop = scrollTop;
+  renderedRecallEntries = finals;
+}
+
+function selectRecallWindow(seconds) {
+  if (![15, 30, 60].includes(seconds)) return;
+  recallSeconds = seconds;
+  recallHeadingEl.textContent = `Previous ${seconds} seconds`;
+  for (const button of recallButtons) {
+    button.setAttribute("aria-pressed", String(Number(button.dataset.seconds) === seconds));
+  }
+  // Filtering is entirely local, including when the socket is disconnected.
+  renderRecall();
+}
+
 function acceptCaptionUpdate(msg) {
   // Validate before comparisons or state changes; extra fields are ignored.
   if (!Number.isSafeInteger(msg.segment) || msg.segment <= 0 ||
@@ -129,8 +219,10 @@ function acceptCaptionUpdate(msg) {
         (msg.revision === previous.revision && !msg.final)) return;
   }
 
+  // Match the server's lenient text policy without coercing arbitrary objects.
+  const caption = typeof msg.text === "string" ? msg : { ...msg, text: "" };
   const row = current ? current.row : document.createElement("div");
-  renderCaption(row, msg);
+  renderCaption(row, caption);
   if (!current) {
     // Late or restored captions belong in segment order, not arrival order.
     row.dataset.segment = String(msg.segment);
@@ -141,7 +233,7 @@ function acceptCaptionUpdate(msg) {
 
   // Reuse the row so accepted revisions replace text without moving the line.
   captionsBySegment.set(msg.segment, {
-    caption: msg,
+    caption,
     row,
     stale: false,
     // Only accepted updates refresh the clock; finals get their full local window.
@@ -156,24 +248,37 @@ function acceptCaptionUpdate(msg) {
   if (msg.final) recordFinalForResume(msg.segment, msg.revision);
   updateEmptyState();
   liveEl.scrollTop = liveEl.scrollHeight;
+  if (msg.final) renderRecall();
 }
 
 function pruneExpiredCaptions() {
   const now = performance.now();
   const cutoff = now - CAPTION_RETENTION_MS;
-  // Abandon an unfilled gap once it is older than the local retention window:
-  // the missing final has left the server's window too, so resume from the
-  // oldest parked final instead of parking every later final forever.
-  if (gapSince !== 0 && now - gapSince > CAPTION_RETENTION_MS) {
-    const oldest = Math.min(...pendingFinals.keys());
-    contiguousFinal = { segment: oldest, revision: pendingFinals.get(oldest) };
-    pendingFinals.delete(oldest);
+  // Drop parked finals on their own age: past the retention window their
+  // final is older than the 60 s this client can display and the server's
+  // window is gone too, so it is unreachable. This alone bounds the map to
+  // one window of the stream, even with recurring gaps.
+  for (const [segment, held] of pendingFinals) {
+    if (held.parkedAt <= cutoff) pendingFinals.delete(segment);
+  }
+  // No parked entry left means no gap is observed any more: drop the stale
+  // observation time so a later gap is aged from its own first evidence
+  // instead of inheriting an already-expired age.
+  if (pendingFinals.size === 0) gapSince = 0;
+  // Abandon the gap itself once its own age passed the window: resume from
+  // the oldest parked final instead of letting the head stick. gapSince is
+  // only ever set from real observation times, never reset to "now".
+  if (gapSince !== 0 && pendingFinals.size > 0 && now - gapSince > CAPTION_RETENTION_MS) {
+    const { segment, entry } = oldestParked();
+    contiguousFinal = { segment, revision: entry.revision };
+    pendingFinals.delete(segment);
     while (pendingFinals.has(contiguousFinal.segment + 1)) {
       const next = contiguousFinal.segment + 1;
-      contiguousFinal = { segment: next, revision: pendingFinals.get(next) };
+      contiguousFinal = { segment: next, revision: pendingFinals.get(next).revision };
       pendingFinals.delete(next);
     }
-    gapSince = pendingFinals.size === 0 ? 0 : performance.now();
+    // The new gap's age is the real age of its oldest parked entry.
+    gapSince = pendingFinals.size === 0 ? 0 : minParkedAt();
   }
   for (const [segment, entry] of prunedSegments) {
     if (entry.expiresAt <= now) prunedSegments.delete(segment);
@@ -196,11 +301,15 @@ function pruneExpiredCaptions() {
     }
   }
   updateEmptyState();
+  // Expire the selected recall view even when the source is idle.
+  renderRecall();
 }
 
 function setStatus(text, connected = false) {
   statusEl.textContent = text;
-  statusEl.style.color = connected ? "green" : "tomato";
+  // Colour lives in the stylesheet (see .status-* rules in index.html),
+  // matching how the caption rows are styled.
+  statusEl.className = connected ? "status-connected" : "status-offline";
 }
 
 function connect() {
@@ -214,7 +323,7 @@ function connect() {
   ws = socket;
 
   socket.addEventListener("open", () => {
-    reconnectAttempts = 0;
+    openedAt = performance.now();
     setStatus("connected", true);
     socket.send(JSON.stringify({
       type: "CLIENT_HELLO",
@@ -259,9 +368,18 @@ function connect() {
     // A late close from a socket that has already been replaced must not
     // reschedule a second, duplicate reconnection.
     if (socket !== ws) return;
+    // Only a connection that actually survived earns a fresh backoff. A
+    // flash open (accepted, then immediately dropped) must not reset the
+    // counter, or a failing server would be hammered at a steady 1 Hz.
+    if (openedAt >= 0 && performance.now() - openedAt > RECONNECT_MAX_MS) {
+      reconnectAttempts = 0;
+    }
     const attempt = ++reconnectAttempts;
     setStatus(`disconnected - reconnecting (attempt ${attempt})`);
-    const delay = Math.min(RECONNECT_BASE_MS * 2 ** (attempt - 1), RECONNECT_MAX_MS);
+    // Jitter the delay between half and full so clients that lost the server
+    // at the same instant do not all redial on the same 1s/2s/4s/... schedule.
+    const base = Math.min(RECONNECT_BASE_MS * 2 ** (attempt - 1), RECONNECT_MAX_MS);
+    const delay = base * (0.5 + Math.random() / 2);
     reconnectTimer = setTimeout(connect, delay);
   });
 
@@ -272,12 +390,12 @@ function connect() {
   });
 }
 
-for (const button of document.querySelectorAll("button[data-seconds]")) {
+for (const button of recallButtons) {
   button.addEventListener("click", () => {
-    const seconds = Number(button.dataset.seconds);
-    recallEl.textContent = `TODO: show finalized captions from the previous ${seconds} seconds using local state.`;
+    selectRecallWindow(Number(button.dataset.seconds));
   });
 }
 
+selectRecallWindow(30);
 setInterval(pruneExpiredCaptions, CLEANUP_INTERVAL_MS);
 connect();
