@@ -10,9 +10,9 @@
  *   - removes expired finals and abandoned provisional rows
  *   - recalls 15/30/60 seconds of locally received finalized captions
  *   - reconnects automatically with backoff and reports connection state
+ *   - merges HISTORY recovery bursts without duplicating finalized captions
  *
  * Graded TODOs:
- *   - HISTORY merge/deduplication
  *   - usable final UI
  */
 
@@ -348,12 +348,18 @@ function connect() {
       // in acceptCaptionUpdate already reject stale/duplicate state.
       acceptCaptionUpdate(msg);
     } else if (msg.type === "HISTORY") {
-      console.log(`HISTORY with ${msg.items?.length ?? 0} item(s)`, msg);
-      // TODO(#8): route each item through acceptCaptionUpdate (which calls
-      // recordFinalForResume) so replayed finals render, advance the resume
-      // run over segments missed during a disconnect, and dedupe against
-      // already-held state. Until then, a disconnect gap clears only via the
-      // retention-based abandon in pruneExpiredCaptions.
+      // Merge the recovery burst through the normal accept path: a held
+      // final is never re-rendered (dedup), rows are reused, and the
+      // contiguous resume run advances so the next hello stops
+      // re-requesting these segments.
+      const items = msg.items;
+      if (Array.isArray(items)) {
+        for (const item of items) {
+          if (item && item.type === "CAPTION_UPDATE") {
+            acceptCaptionUpdate(item);
+          }
+        }
+      }
     }
   });
 
