@@ -13,7 +13,6 @@
  *   - merges HISTORY recovery bursts without duplicating finalized captions
  *
  * Graded TODOs:
- *   - HISTORY merge/deduplication
  *   - usable final UI
  */
 

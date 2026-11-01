@@ -366,3 +366,70 @@ test("recurring gaps stay bounded: parked finals expire on their own age", () =>
   // The live window shows only recent rows, not an accumulated backlog.
   assert.ok(c.rows().length <= 75, `live window holds ${c.rows().length} rows`);
 });
+
+const FINAL = (segment, revision, text) => ({
+  type: "CAPTION_UPDATE", segment, revision, source_ts: 1, final: true, text,
+});
+
+test("HISTORY recovery burst renders missed finals once and advances the resume run", () => {
+  const c = client();
+  c.open();
+  c.send(1, 2, true, "one");
+  c.send(2, 1, true, "two");
+  // The client was briefly offline: segments 3-5 finalized. On reconnect the
+  // server answers with a HISTORY burst, oldest to newest.
+  c.raw(JSON.stringify({ type: "HISTORY", items: [
+    FINAL(3, 2, "three"), FINAL(4, 1, "four"), FINAL(5, 3, "five"),
+  ]}));
+  assert.deepEqual(c.rows().map(row => row.dataset.segment), ["1", "2", "3", "4", "5"]);
+  assert.match(c.rows()[2].textContent, /^\[FINAL\].*three$/);
+  // Replaying the same burst (e.g. a redundant reconnect) must not add rows
+  // or overwrite held finals.
+  c.raw(JSON.stringify({ type: "HISTORY", items: [FINAL(3, 2, "three"), FINAL(4, 1, "four")] }));
+  assert.deepEqual(c.rows().map(row => row.dataset.segment), ["1", "2", "3", "4", "5"]);
+  assert.match(c.rows()[1].textContent, /two$/);
+  // The run advanced across the recovered gap: the next hello resumes at 5.
+  c.close();
+  c.advance(1000);
+  c.open();
+  const hello = c.sockets[c.sockets.length - 1].sent[0];
+  assert.deepEqual([hello.last_segment, hello.last_revision], [5, 3]);
+});
+
+test("late join: HISTORY before any live caption, batched, and tolerant of junk items", () => {
+  const c = client();
+  c.open();
+  // A late joiner's first message is the recovery window. The server splits
+  // large windows into several HISTORY messages, oldest to newest overall.
+  c.raw(JSON.stringify({ type: "HISTORY", items: [FINAL(40, 1, "a"), FINAL(41, 1, "b")] }));
+  c.raw(JSON.stringify({ type: "HISTORY", items: [
+    null,                                     // junk item: skipped
+    { segment: 42, revision: 1, final: true }, // missing type: skipped
+    FINAL(42, 1, "c"),
+  ]}));
+  assert.deepEqual(c.rows().map(row => row.dataset.segment), ["40", "41", "42"]);
+  // The first accepted final anchors the run; live updates continue after.
+  c.send(43, 1, true, "live");
+  c.close();
+  c.advance(1000);
+  c.open();
+  const hello = c.sockets[c.sockets.length - 1].sent[0];
+  assert.deepEqual([hello.last_segment, hello.last_revision], [43, 1]);
+});
+
+test("HISTORY that starts above the run head parks over the gap, cursor never jumps", () => {
+  const c = client();
+  c.open();
+  c.send(1, 1, true);
+  c.send(2, 1, true);
+  // Long outage: the server window only reaches back to 4; segment 3 is gone
+  // for good. 4 and 5 must still render, in order, without the resume cursor
+  // jumping past a final this client does not hold.
+  c.raw(JSON.stringify({ type: "HISTORY", items: [FINAL(4, 1, "four"), FINAL(5, 1, "five")] }));
+  assert.deepEqual(c.rows().map(row => row.dataset.segment), ["1", "2", "4", "5"]);
+  c.close();
+  c.advance(1000);
+  c.open();
+  const hello = c.sockets[c.sockets.length - 1].sent[0];
+  assert.deepEqual([hello.last_segment, hello.last_revision], [2, 1]);
+});
