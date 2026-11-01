@@ -43,11 +43,29 @@ import sys
 BUFFER_BYTES = 65536
 
 
+class Link:
+    """A client connection and the upstream connection paired with it."""
+
+    def __init__(self, client_w: asyncio.StreamWriter, server_w: asyncio.StreamWriter) -> None:
+        self.writers = (client_w, server_w)
+        self.pumps: list[asyncio.Task] = []
+
+    def close(self) -> None:
+        # Cancel before closing: a pump held at the freeze gate is not
+        # reading, so closing its socket alone would never wake it and the
+        # link would leak out of the live set.
+        for pump in self.pumps:
+            pump.cancel()
+        for writer in self.writers:
+            if not writer.is_closing():
+                writer.close()
+
+
 class CutProxy:
     def __init__(self, listen_port: int, target_port: int) -> None:
         self.listen_port = listen_port
         self.target_port = target_port
-        self.pairs: list[tuple[asyncio.StreamWriter, asyncio.StreamWriter]] = []
+        self.links: list[Link] = []
         self.relaying = asyncio.Event()
         self.relaying.set()
         self.server: asyncio.Server | None = None
@@ -63,6 +81,9 @@ class CutProxy:
                 data = await reader.read(BUFFER_BYTES)
                 if not data:
                     break
+                # Gate again: a read that was already in flight when
+                # `freeze` was typed must not deliver its chunk either.
+                await self.relaying.wait()
                 writer.write(data)
                 await writer.drain()
         except (ConnectionError, asyncio.IncompleteReadError):
@@ -78,30 +99,27 @@ class CutProxy:
             print(f"[proxy] upstream connect failed: {exc}", flush=True)
             client_w.close()
             return
-        pair = (client_w, server_w)
-        self.pairs.append(pair)
-        print(f"[proxy] connection open; live={len(self.pairs)}", flush=True)
+        link = Link(client_w, server_w)
+        link.pumps = [
+            asyncio.create_task(self._pump(client_r, server_w)),
+            asyncio.create_task(self._pump(server_r, client_w)),
+        ]
+        self.links.append(link)
+        print(f"[proxy] connection open; live={len(self.links)}", flush=True)
         try:
-            await asyncio.gather(
-                self._pump(client_r, server_w),
-                self._pump(server_r, client_w),
-            )
+            await asyncio.gather(*link.pumps, return_exceptions=True)
         finally:
-            if pair in self.pairs:
-                self.pairs.remove(pair)
-            for writer in pair:
-                if not writer.is_closing():
-                    writer.close()
-            print(f"[proxy] connection closed; live={len(self.pairs)}", flush=True)
+            if link in self.links:
+                self.links.remove(link)
+            link.close()
+            print(f"[proxy] connection closed; live={len(self.links)}", flush=True)
 
     # --- commands ---------------------------------------------------------
 
     def cut(self) -> int:
-        count = len(self.pairs)
-        for pair in list(self.pairs):
-            for writer in pair:
-                if not writer.is_closing():
-                    writer.close()
+        count = len(self.links)
+        for link in list(self.links):
+            link.close()
         return count
 
     async def up(self) -> None:
@@ -128,7 +146,7 @@ class CutProxy:
     def status(self) -> None:
         mode = "relaying" if self.relaying.is_set() else "frozen"
         listening = "listening" if self.server is not None else "not listening"
-        print(f"[proxy] {mode}; {listening}; live={len(self.pairs)}", flush=True)
+        print(f"[proxy] {mode}; {listening}; live={len(self.links)}", flush=True)
 
     async def run_commands(self) -> bool:
         """Read commands until `quit` (True) or end of input (False).
