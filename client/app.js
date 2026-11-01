@@ -317,6 +317,9 @@ function connect() {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
+  // This dial has not opened yet, so it may not count as a surviving
+  // connection when its close decides whether to reset the backoff.
+  openedAt = -1;
   setStatus("connecting");
   const socket = new WebSocket(WS_URL);
   ws = socket;
