@@ -729,8 +729,10 @@ class ClientState:
         self.send_started = time.monotonic()
         self.in_flight_sequence = sequence
         try:
+            # Avoid a compressed empty final fragment at the receiver byte limit.
             if (self.fragment_checkpoints and
-                    (self.provisional_hold or self._checkpoint_due(size, self.send_started))):
+                    (self.provisional_hold or self._checkpoint_due(size, self.send_started)) and
+                    size != MAX_HISTORY_MESSAGE_BYTES):
                 # Frame-based peer queues then hold fewer complete captions.
                 # recv() still returns the identical single JSON message.
                 step = max(1, (len(payload) + self.MAX_RECOVERY_FRAGMENTS - 1)

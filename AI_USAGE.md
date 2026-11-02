@@ -182,6 +182,8 @@ For the follow-up, Codex considered extracting a helper for the duplicated clien
 
 On the further pass, Codex reconsidered the earlier decision to leave the duplicated client resume loops alone. Extracting the full shared block, including the head update and real gap-age calculation, removes duplication while preserving operation order and reduces the target files by six lines. A focused expiry-and-next-gap regression passed against both the original and refactored clients; it adds test lines, so the total repository line count did not fall.
 
+For the exact-limit fix, Codex initially considered reserving space only in HISTORY batching. A real WebSocket probe showed an equally sized standalone live caption could fail the same way, so the accepted change instead uses the common sender's existing unfragmented path at exactly 1 MiB. The boundary tests use UTF-8 byte sizes and reproduced the original failure before the fix; blocked-sender isolation is simulated, while actual slow-reader behavior is measured separately.
+
 ## Responsibility statement
 
 We understand that the team remains responsible for the submitted code, experimental results, and claims, and that every member may be asked to explain or modify relevant code during the viva.
