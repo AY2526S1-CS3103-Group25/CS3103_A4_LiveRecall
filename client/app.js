@@ -1,20 +1,4 @@
-/*
- * LiveRecall browser client: live revision display, local recall, and
- * automatic reconnect with visible connection state.
- *
- * Implemented behavior:
- *   - opens a WebSocket
- *   - sends CLIENT_HELLO, resuming from the highest contiguous finalized caption held locally
- *   - replaces accepted revisions in the same caption row
- *   - distinguishes provisional/final captions and protects finalized text
- *   - removes expired finals and abandoned provisional rows
- *   - recalls 15/30/60 seconds of locally received finalized captions
- *   - reconnects automatically with backoff and reports connection state
- *   - merges HISTORY recovery bursts without duplicating finalized captions
- *
- * Graded TODOs:
- *   - usable final UI
- */
+/* Live revision display, local recall, and automatic reconnect. */
 
 const WS_URL = "ws://127.0.0.1:8765";
 // Keep 60 seconds of finals plus a small margin; check expiry even when idle.
@@ -41,21 +25,10 @@ const captionsBySegment = new Map();
 const prunedSegments = new Map();
 // Used only for cleanup: older provisionals may be abandoned as the stream moves on.
 let latestSegment = 0;
-// Resume state for CLIENT_HELLO: the highest segment N such that this client
-// holds every finalized caption from its first received final through N.
-// We report this contiguous run rather than a high-water mark: the server may
-// skip everything at or below the reported point, so a mark that jumps over a
-// segment we never got would make that segment unreachable.
-// pendingFinals holds finals parked *above* a gap (the missing segment just
-// past the run head). Each entry keeps the time it was parked:
-//   - an entry older than the local retention window is dropped on its own
-//     age (its final is past the 60 s this client displays and past the
-//     server's window too), which alone bounds the map to one window of the
-//     stream even when gaps recur;
-//   - the gap itself is abandoned once its own age passes the window, using
-//     real observation times only. The age is never reset to "now" for
-//     already-old gaps, so recurring gaps cannot restart the retention
-//     period and drag the head further behind.
+// Resume from the contiguous finalized run, so gaps remain recoverable.
+// Finals above a gap are parked with their observation times. Old entries and
+// gaps expire after the retention window; using their actual ages bounds the
+// map and prevents recurring gaps from repeatedly extending the window.
 const pendingFinals = new Map(); // segment -> { revision, parkedAt }
 let contiguousFinal = { segment: 0, revision: 0 };
 let sawFirstFinal = false;
@@ -85,6 +58,18 @@ function oldestParked() {
   return entry === null ? null : { segment, entry };
 }
 
+function advanceResumeHead(segment, revision) {
+  contiguousFinal = { segment, revision };
+  pendingFinals.delete(segment);
+  while (pendingFinals.has(contiguousFinal.segment + 1)) {
+    const next = contiguousFinal.segment + 1;
+    contiguousFinal = { segment: next, revision: pendingFinals.get(next).revision };
+    pendingFinals.delete(next);
+  }
+  // Keep the remaining gap's first observation time; never re-age it.
+  gapSince = pendingFinals.size === 0 ? 0 : minParkedAt();
+}
+
 function recordFinalForResume(segment, revision) {
   if (!sawFirstFinal) {
     // The first final this tab accepts anchors the run; the live stream is
@@ -95,17 +80,7 @@ function recordFinalForResume(segment, revision) {
   }
   if (segment <= contiguousFinal.segment) return; // at/below the head: already covered
   if (segment === contiguousFinal.segment + 1) {
-    contiguousFinal = { segment, revision };
-    pendingFinals.delete(segment);
-    // Fold in any higher finals already held, in order.
-    while (pendingFinals.has(contiguousFinal.segment + 1)) {
-      const next = contiguousFinal.segment + 1;
-      contiguousFinal = { segment: next, revision: pendingFinals.get(next).revision };
-      pendingFinals.delete(next);
-    }
-    // The run moved: any remaining gap was first observed when its oldest
-    // parked entry was parked, so keep that real age rather than re-aging it.
-    gapSince = pendingFinals.size === 0 ? 0 : minParkedAt();
+    advanceResumeHead(segment, revision);
   } else {
     // Gap above the head: hold the final until (if ever) the missing segment
     // arrives; the resume report stays at the run head meanwhile.
@@ -269,15 +244,7 @@ function pruneExpiredCaptions() {
   // only ever set from real observation times, never reset to "now".
   if (gapSince !== 0 && pendingFinals.size > 0 && now - gapSince > CAPTION_RETENTION_MS) {
     const { segment, entry } = oldestParked();
-    contiguousFinal = { segment, revision: entry.revision };
-    pendingFinals.delete(segment);
-    while (pendingFinals.has(contiguousFinal.segment + 1)) {
-      const next = contiguousFinal.segment + 1;
-      contiguousFinal = { segment: next, revision: pendingFinals.get(next).revision };
-      pendingFinals.delete(next);
-    }
-    // The new gap's age is the real age of its oldest parked entry.
-    gapSince = pendingFinals.size === 0 ? 0 : minParkedAt();
+    advanceResumeHead(segment, entry.revision);
   }
   for (const [segment, entry] of prunedSegments) {
     if (entry.expiresAt <= now) prunedSegments.delete(segment);
