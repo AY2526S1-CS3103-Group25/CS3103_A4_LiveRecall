@@ -155,8 +155,9 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         await ws.pong_started.wait()
         await server.ingest_caption_update(caption(2))
         await asyncio.wait_for(self.handlers[0], 1)
-        self.assertEqual(client.final_cursor, 1)
-        self.assertEqual([m['segment'] for m in ws.messages[1:]], [1])
+        # A pending feedback probe no longer serializes ordinary live sends.
+        self.assertEqual(client.final_cursor, 2)
+        self.assertEqual([m['segment'] for m in ws.messages[1:]], [1, 2])
         self.assertEqual(client.failure_reason, 'Peer checkpoint timed out; reconnect')
         self.assertTrue(ws.pong.cancelled())
 
@@ -390,7 +391,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 client = await self.connect(ws)
                 self.assertEqual(client.fragment_checkpoints, enabled)
 
-    async def test_older_receivers_keep_unfragmented_gradual_recovery(self):
+    async def test_older_receivers_keep_unfragmented_recovery(self):
         ws = PausedClient()
         client = server.ClientState(ws)
         await client._checkpoint(0)
@@ -404,7 +405,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         client.healthy_since = server.time.monotonic() - client.recovery_window
         client.healthy_checkpoints = 2
         await client._checkpoint(1)
-        self.assertEqual(client.provisional_hold, 0.2)
+        self.assertEqual(client.provisional_hold, 0)
 
     async def test_blocked_later_history_batch_isolated_with_bounded_live_catch_up(self):
         class PausedSecondBatch(PausedClient):

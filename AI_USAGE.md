@@ -164,6 +164,10 @@ The review also challenged receiver-specific framing and whether 17.3 exists. Th
 
 With the final ten-second deadline, three fresh modern-receiver T3 runs each retained 100% final completeness and zero duplicate/stale/error counts. Exact final sets were verified for all 100 clients, and all 90 normal clients retained every source revision. Median Fresh Final Caption Ratio was 99.55%; normal-client P95 was 36.99 ms and slow-client P95 was 480.65 ms. A separate 16.1.1 compatibility run retained 100% final completeness with zero duplicate/stale/error counts (Fresh Final Caption Ratio 94.34%); all client final sets were checked. All 54 server regressions passed on both versions and the development startup check passed. Raw measurements remain ignored under `results/issue10-review/final/`. Ubuntu/netem remains deferred.
 
+## Checkpoint pacing and recovery (#34)
+
+We discussed the latency and recovery issues found in local testing and chose bounded background checkpoint feedback so healthy clients can keep receiving revisions. We rejected an approach that worsened bandwidth latency and kept the fix focused on checkpoint pacing and recovery. Ubuntu validation is still pending.
+
 ## Responsibility statement
 
 We understand that the team remains responsible for the submitted code, experimental results, and claims, and that every member may be asked to explain or modify relevant code during the viva.
