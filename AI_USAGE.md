@@ -164,6 +164,28 @@ The review also challenged receiver-specific framing and whether 17.3 exists. Th
 
 With the final ten-second deadline, three fresh modern-receiver T3 runs each retained 100% final completeness and zero duplicate/stale/error counts. Exact final sets were verified for all 100 clients, and all 90 normal clients retained every source revision. Median Fresh Final Caption Ratio was 99.55%; normal-client P95 was 36.99 ms and slow-client P95 was 480.65 ms. A separate 16.1.1 compatibility run retained 100% final completeness with zero duplicate/stale/error counts (Fresh Final Caption Ratio 94.34%); all client final sets were checked. All 54 server regressions passed on both versions and the development startup check passed. Raw measurements remain ignored under `results/issue10-review/final/`. Ubuntu/netem remains deferred.
 
+## Browser lecture reset — issues #35 / #33
+
+Codex implemented a small optional lecture identity extension using the existing
+server generation boundary. TDD first demonstrated that the browser kept old
+finals and did not send lecture identity; a separate failing regression showed
+that callbacks from a replaced socket could restore an obsolete lecture. The
+fix clears caption/recall/deduplication/resume state on changed HISTORY identity
+and guards old socket callbacks. Same-lecture reconnects keep their state.
+
+Critical evaluation: resetting on every reconnect would lose valid recent
+context and defeat duplicate protection. Keeping only a new browser ID without
+server cursor validation would still omit new lecture finals below the old
+cursor. The accepted design pairs an opaque per-lecture ID with the cursor,
+rebases only a known mismatch, and preserves legacy hello semantics. Existing
+live-client generation failure/reconnect remains in place; no sender pacing or
+instructor harness code changed.
+
+Validation uses actual app.js with the existing DOM/socket boundary adapter,
+and real loopback WebSockets for resume, legacy compatibility and both source
+restart paths. Tests also cover HISTORY byte budgeting with identity metadata.
+Ubuntu/netem and sustained performance claims are outside this fix.
+
 ## Responsibility statement
 
 We understand that the team remains responsible for the submitted code, experimental results, and claims, and that every member may be asked to explain or modify relevant code during the viva.

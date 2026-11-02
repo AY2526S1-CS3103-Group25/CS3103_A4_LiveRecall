@@ -114,6 +114,23 @@ function recordFinalForResume(segment, revision) {
   }
 }
 
+// Opaque lecture identity; absent on legacy servers. It travels with the cursor.
+let streamId;
+
+function resetLecture() {
+  captionsBySegment.clear();
+  prunedSegments.clear();
+  pendingFinals.clear();
+  contiguousFinal = { segment: 0, revision: 0 };
+  sawFirstFinal = false;
+  gapSince = 0;
+  latestSegment = 0;
+  liveEl.replaceChildren();
+  renderedRecallEntries = null;
+  updateEmptyState();
+  renderRecall();
+}
+
 let ws;
 let clientId;
 // Reconnect bookkeeping. The timer is cleared before each new dial so a
@@ -322,6 +339,7 @@ function connect() {
   ws = socket;
 
   socket.addEventListener("open", () => {
+    if (socket !== ws) return;
     openedAt = performance.now();
     setStatus("connected", true);
     socket.send(JSON.stringify({
@@ -330,11 +348,14 @@ function connect() {
       session: "L1",
       last_segment: contiguousFinal.segment,
       last_revision: contiguousFinal.revision,
+      stream_id: streamId,
       history_seconds: 30
     }));
   });
 
   socket.addEventListener("message", (event) => {
+    // A replaced connection may still have queued callbacks from the old lecture.
+    if (socket !== ws) return;
     let msg;
     try {
       msg = JSON.parse(event.data);
@@ -343,15 +364,16 @@ function connect() {
     }
     if (msg === null || typeof msg !== "object" || Array.isArray(msg)) return;
     if (msg.type === "CAPTION_UPDATE") {
-      // No socket-identity guard here on purpose: a caption that arrives just
-      // as a socket dies is still valid stream data, and the revision checks
-      // in acceptCaptionUpdate already reject stale/duplicate state.
       acceptCaptionUpdate(msg);
     } else if (msg.type === "HISTORY") {
       // Merge the recovery burst through the normal accept path: a held
       // final is never re-rendered (dedup), rows are reused, and the
       // contiguous resume run advances so the next hello stops
       // re-requesting these segments.
+      if (typeof msg.stream_id === "string" && msg.stream_id.length > 0) {
+        if (streamId !== undefined && streamId !== msg.stream_id) resetLecture();
+        streamId = msg.stream_id;
+      }
       const items = msg.items;
       if (Array.isArray(items)) {
         for (const item of items) {

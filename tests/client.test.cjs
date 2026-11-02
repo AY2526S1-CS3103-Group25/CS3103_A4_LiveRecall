@@ -86,6 +86,7 @@ function client() {
     status: elements["status"],
     sockets,
     rows: () => elements.live.children,
+    recallRows: () => elements.recall.children,
     raw: data => socket.listeners.message({ data }),
     send(segment, revision, final = false, text = "caption", extra = {}) {
       this.raw(JSON.stringify({ type: "CAPTION_UPDATE", segment, revision, final, text, ...extra }));
@@ -432,4 +433,49 @@ test("HISTORY that starts above the run head parks over the gap, cursor never ju
   c.open();
   const hello = c.sockets[c.sockets.length - 1].sent[0];
   assert.deepEqual([hello.last_segment, hello.last_revision], [2, 1]);
+});
+
+
+test("a changed stream clears old lecture rows, recall and resume before history", () => {
+  const c = client();
+  c.open();
+  c.raw(JSON.stringify({ type: "HISTORY", stream_id: "lecture-a", items: [FINAL(1, 3, "old one"), FINAL(3, 2, "old gap")] }));
+  c.send(4, 1, false, "old unfinished");
+  c.close();
+  c.advance(1000);
+  c.open();
+  assert.equal(c.sockets[1].sent[0].stream_id, "lecture-a");
+  c.raw(JSON.stringify({ type: "HISTORY", stream_id: "lecture-b", items: [] }));
+  assert.equal(c.rows().length, 0);
+  assert.equal(c.recallRows().length, 0);
+  assert.equal(c.empty.textContent, "Waiting for captions.");
+  c.raw(JSON.stringify({ type: "HISTORY", stream_id: "lecture-b", items: [FINAL(1, 1, "new one")] }));
+  c.send(2, 1, true, "new two");
+  assert.deepEqual(c.rows().map(row => row.textContent), [
+    "[FINAL] segment 1 rev 1: new one", "[FINAL] segment 2 rev 1: new two"
+  ]);
+  c.close();
+  c.advance(2000);
+  c.open();
+  const hello = c.sockets[2].sent[0];
+  assert.deepEqual([hello.stream_id, hello.last_segment, hello.last_revision], ["lecture-b", 2, 1]);
+});
+
+test("same-stream reconnect preserves rows and obsolete sockets cannot reset the lecture", () => {
+  const c = client();
+  c.open();
+  c.raw(JSON.stringify({ type: "HISTORY", stream_id: "a", items: [FINAL(1, 1, "old")] }));
+  const old = c.sockets[0];
+  c.close();
+  c.advance(1000);
+  c.open();
+  c.raw(JSON.stringify({ type: "HISTORY", stream_id: "a", items: [FINAL(1, 1, "duplicate")] }));
+  assert.equal(c.rows().length, 1);
+  assert.match(c.rows()[0].textContent, /old$/);
+  c.raw(JSON.stringify({ type: "HISTORY", stream_id: "b", items: [FINAL(1, 1, "new")] }));
+  old.listeners.message({ data: JSON.stringify({ type: "HISTORY", stream_id: "a", items: [FINAL(1, 1, "obsolete")] }) });
+  old.listeners.message({ data: JSON.stringify(FINAL(2, 1, "obsolete caption")) });
+  old.open();
+  assert.deepEqual(c.rows().map(row => row.textContent), ["[FINAL] segment 1 rev 1: new"]);
+  assert.equal(old.sent.length, 1, "obsolete open must not send another hello");
 });

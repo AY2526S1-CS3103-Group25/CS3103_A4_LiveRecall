@@ -64,3 +64,28 @@ In that case it uses the existing CAPTION_UPDATE format during recovery, after
 an initial HISTORY reply. Both paths use the same revision/final deduplication
 rules. The complete recovery snapshot precedes updates accepted after the hello.
 The server's 70-second retention window and resume-cursor filtering are unchanged.
+
+
+## Lecture identity extension (issue #35, parent spec #33)
+
+Each server lecture has an opaque `stream_id`, newly generated on server startup
+and either existing source-reset path. Every HISTORY batch, including an empty
+reply, carries this same ID. Its bytes count toward the existing 1 MiB limit.
+The browser returns its last known ID as optional `CLIENT_HELLO.stream_id` beside
+its resume cursor. A different nonempty ID makes the server ignore the old
+cursor and snapshot the requested window from the current lecture. Missing, empty
+or invalid IDs keep the legacy cursor behavior; required protocol fields and
+caption payloads are unchanged.
+
+On a changed HISTORY ID, the browser clears live rows, recall, revision/final
+guards and resume/gap state before merging that batch. Later batches with the
+same ID merge normally; reconnecting within that lecture keeps deduplication
+and the contiguous cursor. A legacy HISTORY without an ID still merges normally.
+Callbacks from a replaced socket cannot alter the current lecture.
+
+Existing generation checks close old live connections for reconnect rather than
+mixing lectures on one connection. New source traffic triggers this promptly;
+the five-second idle cleanup also detects a reset with no subsequent captions.
+Older browsers and load clients may ignore the added field. They keep the
+required protocol behavior, but automatic cross-lecture browser clearing needs
+the updated client and server together. The source-reset heuristic is unchanged.

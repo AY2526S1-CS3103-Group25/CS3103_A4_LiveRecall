@@ -126,13 +126,14 @@ class HistoryMessageTests(unittest.TestCase):
     def test_large_snapshot_is_lossless_and_each_message_fits_receiver(self):
         items = [json.loads(caption(segment).payload)
                  for segment in range(1, 20001)]
-        messages = list(server.history_messages(items))
+        messages = list(server.history_messages(items, "lecture-identifier"))
         self.assertGreater(len(messages), 1)
         recovered = []
         for raw in messages:
             self.assertLessEqual(len(raw.encode('utf-8')), 2**20)
             message = json.loads(raw)
             self.assertEqual(message['type'], 'HISTORY')
+            self.assertEqual(message['stream_id'], 'lecture-identifier')
             recovered.extend(message['items'])
         self.assertEqual(recovered, items)
 
@@ -146,7 +147,7 @@ class HistoryMessageTests(unittest.TestCase):
         for item in items:
             item['text'] = '\u754c' * 100
         with patch.object(server, 'MAX_HISTORY_MESSAGE_BYTES', 1024):
-            messages = list(server.history_messages(items))
+            messages = list(server.history_messages(items, "lecture-identifier"))
         self.assertGreater(len(messages), 1)
         self.assertTrue(all(len(raw.encode('utf-8')) <= 1024 for raw in messages))
         self.assertEqual([item for raw in messages
@@ -311,6 +312,66 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WebSocketRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stream_identity_rebases_only_known_mismatched_resume_cursors(self):
+        state = server.SessionState()
+        state.apply(caption(1))
+        with patch.object(server, 'SESSION', state), patch.object(server, 'CLIENTS', {}):
+            async with server.websockets.serve(server.handler, '127.0.0.1', 0) as listener:
+                uri = f"ws://127.0.0.1:{listener.sockets[0].getsockname()[1]}"
+
+                async def recover(**extra):
+                    async with server.websockets.connect(uri) as ws:
+                        await ws.send(json.dumps({'type': 'CLIENT_HELLO',
+                            'last_segment': 1, 'last_revision': 1,
+                            'history_seconds': 60, **extra}))
+                        return json.loads(await asyncio.wait_for(ws.recv(), 2))
+
+                first = await recover(last_segment=0)
+                self.assertIsInstance(first.get('stream_id'), str)
+                self.assertTrue(first['stream_id'])
+                same = await recover(stream_id=first['stream_id'])
+                self.assertEqual(same['stream_id'], first['stream_id'])
+                self.assertEqual(same['items'], [])
+                state.on_source_done()
+                state.on_source_connect()
+                state.apply(caption(1))
+                restarted = await recover(stream_id=first['stream_id'])
+                self.assertNotEqual(restarted['stream_id'], first['stream_id'])
+                self.assertEqual([m['segment'] for m in restarted['items']], [1])
+                legacy = await recover()
+                self.assertEqual(legacy['items'], [])
+
+    async def test_live_clients_reconnect_into_both_source_restart_paths(self):
+        for completed in (True, False):
+            with self.subTest(completed=completed), patch.object(
+                server, 'SESSION', server.SessionState()
+            ), patch.object(server, 'CLIENTS', {}):
+                async with server.websockets.serve(server.handler, '127.0.0.1', 0) as listener:
+                    uri = f"ws://127.0.0.1:{listener.sockets[0].getsockname()[1]}"
+                    async with server.websockets.connect(uri) as old:
+                        await old.send(json.dumps({'type': 'CLIENT_HELLO'}))
+                        identity = json.loads(await old.recv())['stream_id']
+                        async with server.websockets.connect(uri) as source:
+                            await source.send(json.dumps({'type': 'SOURCE_HELLO'}))
+                            await source.send(caption(1).payload)
+                            self.assertEqual(json.loads(await old.recv())['segment'], 1)
+                            if completed:
+                                await source.send(json.dumps({'type': 'SOURCE_DONE'}))
+                        async with server.websockets.connect(uri) as source:
+                            await source.send(json.dumps({'type': 'SOURCE_HELLO'}))
+                            await source.send(caption(1, final=False).payload)
+                            await source.send(caption(1, revision=2).payload)
+                        with self.assertRaises(server.ConnectionClosed):
+                            await asyncio.wait_for(old.recv(), 2)
+                        async with server.websockets.connect(uri) as resumed:
+                            await resumed.send(json.dumps({'type': 'CLIENT_HELLO',
+                                'stream_id': identity, 'last_segment': 1,
+                                'last_revision': 3, 'history_seconds': 60}))
+                            history = json.loads(await asyncio.wait_for(resumed.recv(), 2))
+                            self.assertNotEqual(history['stream_id'], identity)
+                            self.assertEqual([(m['segment'], m['revision'])
+                                              for m in history['items']], [(1, 2)])
+
     async def test_large_history_fits_real_receiver_then_continues_live(self):
         state = server.SessionState()
         for segment in range(1, 20001):
@@ -357,7 +418,7 @@ class WebSocketRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 async with server.websockets.connect(uri) as source, \
                         server.websockets.connect(uri) as observer:
                     await source.send(json.dumps({"type": "SOURCE_HELLO", "session": "L1"}))
-                    self.assertEqual(await hello(observer), {"type": "HISTORY", "items": []})
+                    self.assertEqual((await hello(observer))["items"], [])
                     await source.send(caption(1, source_ts=server.time.time()).payload)
                     self.assertEqual((await receive(observer))["segment"], 1)
                     async with server.websockets.connect(uri) as late:
@@ -372,8 +433,7 @@ class WebSocketRecoveryTests(unittest.IsolatedAsyncioTestCase):
                         history = await hello(resumed, segment=2)
                         self.assertEqual([m["segment"] for m in history["items"]], [3])
                     async with server.websockets.connect(uri) as current:
-                        self.assertEqual(await hello(current, segment=3),
-                                         {"type": "HISTORY", "items": []})
+                        self.assertEqual((await hello(current, segment=3))["items"], [])
 
 
 if __name__ == "__main__":

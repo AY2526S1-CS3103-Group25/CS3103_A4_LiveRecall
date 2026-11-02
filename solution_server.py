@@ -21,6 +21,7 @@ import math
 import random
 import re
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Iterator
@@ -117,6 +118,7 @@ class SessionState:
         self._expired_sequence = 0
         self._active: dict[int, CaptionUpdate] = {}
         self.generation = object()
+        self.stream_id = uuid.uuid4().hex
         self._done = False  # previous source completed with SOURCE_DONE
         # A CAPTION_UPDATE arrived since the last SOURCE_HELLO: the fallback
         # reset in apply() may only fire before this flips (a new stream's
@@ -446,7 +448,7 @@ def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
     )
 
 
-def history_messages(items: list[dict[str, Any]]) -> Iterator[str]:
+def history_messages(items: list[dict[str, Any]], stream_id: str | None = None) -> Iterator[str]:
     """Emit lossless recovery batches before live delivery, one message at a time.
 
     The 70-second retention window is unchanged. Batching bounds wire messages
@@ -454,7 +456,8 @@ def history_messages(items: list[dict[str, Any]]) -> Iterator[str]:
     An item that fits alone but not inside HISTORY uses CAPTION_UPDATE after an
     initial HISTORY reply; the existing client accept path handles either form.
     """
-    prefix, suffix = '{"type":"HISTORY","items":[', ']}'
+    identity = "" if stream_id is None else ',"stream_id":' + json.dumps(stream_id)
+    prefix, suffix = '{"type":"HISTORY"' + identity + ',"items":[', ']}'
     empty_size = len(prefix) + len(suffix)
     batch: list[str] = []
     size = empty_size
@@ -510,6 +513,7 @@ class ClientState:
         self.failed = asyncio.Event()
         self.failure_reason = ""
         self.generation = SESSION.generation
+        self.stream_id = SESSION.stream_id
         # Start at the snapshot/live boundary, not the HELLO cursor: context
         # excluded by history_seconds must not reappear during overload recovery.
         self.final_cursor = SESSION.final_sequence
@@ -760,7 +764,7 @@ class ClientState:
     async def run(self, history: list[dict[str, Any]]) -> None:
         # Establish path RTT before HISTORY can fill the peer's receive queue.
         await self._checkpoint(0)
-        for message in history_messages(history):
+        for message in history_messages(history, self.stream_id):
             self.check_recovery()
             if self.failed.is_set():
                 return
@@ -882,6 +886,11 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
     seconds = 30 if seconds is None else min(60, max(0, seconds))
     # Snapshot and registration are synchronous. The sender owns HISTORY and
     # every subsequent live send; source ingestion never waits for either.
+    # A cursor has meaning only within its lecture. Missing/invalid IDs retain
+    # legacy cursor semantics; a known different ID requests fresh context.
+    stream_id = hello.get("stream_id")
+    if isinstance(stream_id, str) and stream_id and stream_id != SESSION.stream_id:
+        last_segment = last_revision = 0
     items = SESSION.history_items(last_segment, last_revision, seconds)
     # Older Python websockets receivers can crash when recv() times out during
     # fragmentation (upstream #1773, fixed in 17.3). This advisory compatibility
