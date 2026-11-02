@@ -498,6 +498,11 @@ class ClientState:
     # Allow transient receiver congestion, but do not wait for the full library
     # keepalive cycle (up to 40 seconds) on an unanswered probe.
     CHECKPOINT_TIMEOUT = 10.0
+    # At most one unacknowledged probe and this bounded extra send window.
+    # The window pipelines ordinary RTT; a stopped reader cannot accumulate
+    # unlimited bytes in TCP/library buffers while its Pong is outstanding.
+    MAX_CHECKPOINT_IN_FLIGHT_MESSAGES = 128
+    MAX_CHECKPOINT_IN_FLIGHT_BYTES = 256 * 1024
     MAX_PROVISIONAL_HOLD = 1.0
     MAX_RECOVERY_FRAGMENTS = 32
 
@@ -524,6 +529,10 @@ class ClientState:
         self.next_checkpoint = 0.0
         self.checkpoint_messages = 0
         self.checkpoint_bytes = 0
+        self.checkpoint_task: asyncio.Task | None = None
+        self.checkpoint_started = 0.0
+        self.checkpoint_in_flight_messages = 0
+        self.checkpoint_in_flight_bytes = 0
         self.checkpoint_baseline: float | None = None
         self.provisional_hold = 0.0
         self.next_provisional_at = 0.0
@@ -536,7 +545,7 @@ class ClientState:
         self.last_peer_delay = 0.0
 
     def _in_probation(self, now: float) -> bool:
-        return bool(self.fragment_checkpoints and self.last_recovery
+        return bool(self.last_recovery
                     and now - self.last_recovery
                     < max(3 * self.CHECKPOINT_SECONDS, 4 * self.last_peer_delay))
 
@@ -548,23 +557,21 @@ class ClientState:
     def _peer_lag(self, delay: float) -> None:
         now = time.monotonic()
         hold = delay
-        cooldown = 4 * delay
-        window = max(3 * self.CHECKPOINT_SECONDS, 2 * delay)
-        if self.fragment_checkpoints and not self.provisional_hold:
+        if not self.provisional_hold:
             if self._in_probation(now):
                 self.recovery_penalty = min(4.0, 4 * self.recovery_penalty)
             else:
                 self.recovery_penalty = 1.0
         if self.fragment_checkpoints:
             hold = 2 * delay
-            cooldown = self.recovery_penalty * delay if self.recovery_penalty > 1 else 0
-            window = self.CHECKPOINT_SECONDS
+        cooldown = self.recovery_penalty * delay if self.recovery_penalty > 1 else 0
+        window = self.CHECKPOINT_SECONDS
         self.lagging = True
         self.provisional_hold = max(
             self.provisional_hold, min(self.MAX_PROVISIONAL_HOLD, hold)
         )
         # Repeated congestion during probation backs off; an isolated slowdown
-        # can recover without repeating a full cooldown for every hold reduction.
+        # can recover after sustained healthy feedback without repeated halving.
         self.peer_lag_until = max(self.peer_lag_until, now + cooldown)
         self.next_provisional_at = now + self.provisional_hold
         self.healthy_checkpoints = 0
@@ -579,8 +586,8 @@ class ClientState:
         self.checkpoint_bytes += size
         if not due:
             return
-        # Only this connection's sole sender waits. Keep one probe outstanding;
-        # a protocol Pong is congestion feedback, not an application ACK.
+        # One probe per connection: healthy live delivery runs concurrently;
+        # congested delivery waits. Pong is transport feedback, not an app ACK.
         started = now
         pong = await self.ws.ping()
         threshold = max(self.LAG_SECONDS, 4 * (self.checkpoint_baseline or 0))
@@ -616,13 +623,12 @@ class ClientState:
                     self.healthy_since = now
                 if (self.healthy_checkpoints >= 3
                         and now - self.healthy_since >= self.recovery_window):
-                    if self.fragment_checkpoints:
-                        self.provisional_hold = 0.0
-                        self.last_recovery = now
-                    else:
-                        self.provisional_hold /= 2
-                        if self.provisional_hold < self.LAG_SECONDS:
-                            self.provisional_hold = 0.0
+                    # Healthy feedback over time permits a bounded full-rate
+                    # trial for every receiver. Repeated halving on plain
+                    # receivers could suppress revisions long after recovery.
+                    # Probation probes and relapse backoff limit a false trial.
+                    self.provisional_hold = 0.0
+                    self.last_recovery = now
                     self.healthy_checkpoints = 0
                     self.healthy_since = None
             elif self.provisional_hold:
@@ -633,6 +639,48 @@ class ClientState:
         interval = random.uniform(0.75, 1.25) if self.fragment_checkpoints else 1.0
         self.next_checkpoint = now + self.CHECKPOINT_SECONDS * interval
         self.checkpoint_messages = self.checkpoint_bytes = 0
+
+    async def _background_checkpoint(self, size: int) -> None:
+        try:
+            await self._checkpoint(size)
+        except ConnectionClosed:
+            # Wake handle_client even if the sender is idle with no more source
+            # input. The connection's receive task may not have finished yet.
+            self.failed.set()
+        except Exception as exc:
+            print(f"client checkpoint failed: {exc!r}", flush=True)
+            self.fail("Peer checkpoint failed; reconnect")
+
+    async def _delivery_checkpoint(self, size: int) -> None:
+        if self.failed.is_set():
+            return
+        task = self.checkpoint_task
+        if task is not None and not task.done():
+            self.checkpoint_in_flight_messages += bool(size)
+            self.checkpoint_in_flight_bytes += size
+            if (self.provisional_hold or self._in_probation(time.monotonic())
+                    or self.checkpoint_in_flight_messages >= self.MAX_CHECKPOINT_IN_FLIGHT_MESSAGES
+                    or self.checkpoint_in_flight_bytes >= self.MAX_CHECKPOINT_IN_FLIGHT_BYTES):
+                await task
+            return
+        if task is not None:
+            task.result()
+            # The Pong covers traffic preceding its Ping, not later sends.
+            # Retire this task once and carry that later traffic forward.
+            self.checkpoint_messages += self.checkpoint_in_flight_messages
+            self.checkpoint_bytes += self.checkpoint_in_flight_bytes
+            self.checkpoint_in_flight_messages = self.checkpoint_in_flight_bytes = 0
+            self.checkpoint_task = None
+        if self._checkpoint_due(size, time.monotonic()):
+            self.checkpoint_in_flight_messages = 0
+            self.checkpoint_in_flight_bytes = 0
+            self.checkpoint_started = time.monotonic()
+            self.checkpoint_task = asyncio.create_task(self._background_checkpoint(size))
+            if self.provisional_hold or self._in_probation(time.monotonic()):
+                await self.checkpoint_task
+        else:
+            self.checkpoint_messages += bool(size)
+            self.checkpoint_bytes += size
 
     async def _wait_provisional(self, queued_at: float) -> bool:
         if not self.provisional_hold:
@@ -765,13 +813,22 @@ class ClientState:
             if self.failed.is_set():
                 return
             size = await self._send(message)
-            await self._checkpoint(size)
+            await self._delivery_checkpoint(size)
             await asyncio.sleep(0)
         del history, message
         while not self.failed.is_set():
             self.check_recovery()
             if self.failed.is_set():
                 break
+            # Pipeline within the measured path RTT, but stop adding transport
+            # work when feedback is overdue. This wait doesn't itself classify
+            # congestion: the probe retains the separate 100 ms lag threshold.
+            if (self.checkpoint_task is not None and not self.checkpoint_task.done()
+                    and (self.provisional_hold
+                         or time.monotonic() - self.checkpoint_started
+                         >= 4 * (self.checkpoint_baseline or 0))):
+                await self.checkpoint_task
+                continue
             self._observe_lag()
             recovery = self._next_recovery() if self.catch_up else None
             if recovery is not None:
@@ -798,6 +855,8 @@ class ClientState:
                 self.ready.clear()
                 await self.ready.wait()
                 continue
+            if self.failed.is_set():
+                break
             size = await self._send(update.payload, sequence)
             if update.final:
                 self.final_cursor = sequence
@@ -812,7 +871,7 @@ class ClientState:
                     }
             # Hysteresis: resume full coverage only with little fresh queued work
             # and a fast completed send. Keep a single stalled send per client.
-            await self._checkpoint(size)
+            await self._delivery_checkpoint(size)
             if (not self.provisional_hold and not self.catch_up
                     and len(self.pending) <= self.MAX_PENDING // 4
                     and self.pending_bytes <= self.MAX_PENDING_BYTES // 4
@@ -911,6 +970,10 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
             task.result()
     except ConnectionClosed:
         pass
+    except Exception as exc:
+        print(f"client delivery failed: {exc!r}", flush=True)
+        client.fail("Client delivery failed; reconnect")
+        raise
     finally:
         CLIENTS.pop(ws, None)
         # Closing first releases a blocked send without cancelling a partially
@@ -919,9 +982,12 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
             await ws.close(code=1013 if client.failure_reason else 1000,
                            reason=client.failure_reason)
         finally:
-            for task in (sender, reader, failure):
+            tasks = [sender, reader, failure]
+            if client.checkpoint_task is not None:
+                tasks.append(client.checkpoint_task)
+            for task in tasks:
                 task.cancel()
-            await asyncio.gather(sender, reader, failure, return_exceptions=True)
+            await asyncio.gather(*tasks, return_exceptions=True)
         print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}; "
               f"coalesced={client.coalesced}; catch_ups={client.catch_ups}; "
               f"reason={client.failure_reason!r}", flush=True)
