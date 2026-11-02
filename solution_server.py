@@ -33,6 +33,8 @@ CLIENTS: dict[Any, ClientState] = {}
 
 # Match the mandatory load client's receive limit, including the JSON wrapper.
 MAX_HISTORY_MESSAGE_BYTES = 2**20
+DEFAULT_HISTORY_SECONDS = 30
+MAX_HISTORY_SECONDS = 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,37 +56,7 @@ class CaptionUpdate:
 
 
 class SessionState:
-    """Revision metadata and recent finalized captions for the single session.
-
-    Module-level lifetime, independent of any connection: state persists
-    across a mid-stream source disconnect/reconnect so replayed frames stay
-    deduplicated, but resets when a new source connects after the previous
-    stream completed with SOURCE_DONE (a fresh lecture restarting at
-    segment 1 must be deliverable without a server restart). SOURCE_DONE is
-    not guaranteed — a source killed mid-stream never sends it — so there is
-    a fallback: a provisional segment-1 revision-1 frame arriving as the
-    first frame after a SOURCE_HELLO, while segment 1 is already closed,
-    also resets, since a conforming source numbers segments monotonically
-    from 1 and a new stream's s1r1 can only sit in that position (see
-    apply()).
-
-    Memory: the contiguous finalized prefix is compacted to the
-    `closed_up_to` watermark and pruned from `segments`; durability for
-    everything at or below the watermark is enforced by the single int, so
-    late replays of old finals are still rejected after pruning. Correctness
-    does not depend on finalization order — the watermark only advances over
-    a contiguous finalized prefix, and out-of-order segments simply stay in
-    the dict until the gap closes. The O(1) size (just the active segment)
-    relies on in-order finalization, which the spec guarantees only for the
-    starter-kit source; for any other ordering the dict grows with the
-    source's unfinalized window, hard-capped at MAX_TRACKED_SEGMENTS by
-    force-closing the oldest tracked segments. A force-closed segment that
-    never finalized stays eligible for exactly one late final (reopenable),
-    so capping never costs a final for any segment the server actually saw;
-    the only finals forfeited are for segment numbers first appearing > 1024
-    segments behind the frontier, or gap numbers never seen before a forced
-    watermark advance.
-    """
+    """Revision metadata and recent finalized captions for the single session."""
 
     # Hard cap on tracked (unpruned) segments. The instructor source keeps the
     # window at ~1 active segment; the cap only matters if one segment never
@@ -149,43 +121,9 @@ class SessionState:
         self._done = True
 
     def apply(self, update: CaptionUpdate) -> bool:
-        """Record the update; return True if it should be delivered to clients.
-
-        Synchronous on purpose: the check-and-set must not be interrupted by an
-        await, so concurrent ingests on the event loop cannot double-accept.
-
-        New-stream fallback (before the ladder): a provisional segment-1
-        revision-1 frame that is the FIRST frame after a SOURCE_HELLO, while
-        segment 1 is already closed, resets the session. A conforming source
-        numbers segments monotonically from 1, so a new stream's s1r1 can
-        only sit in that exact position; it means the previous stream's
-        source was killed before sending SOURCE_DONE (e.g. Ctrl-C, then
-        rerun against the same server), and without the reset the whole new
-        lecture would be silently dropped as post-final. Deliberately
-        narrow: once any frame has arrived on the connection the fallback is
-        disarmed (a mid-stream or mid-replay s1r1 retransmit can never wipe
-        state), a FINAL s1r1 never triggers it (so a replayed reopenable
-        late final can't either), and a reopenable segment 1 is excluded
-        (its late final must stay deliverable). The one case this misreads —
-        a reconnecting source that replays its whole stream from s1r1 — is
-        informationally indistinguishable from a new lecture, and treating
-        it as one re-broadcasts duplicates instead of silencing a real
-        lecture; no harness component replays at all.
-
-        Reject ladder, top to bottom:
-        - closed segment (<= watermark): dead, except the single late final
-          of a force-closed, never-finalized segment (`_reopenable`);
-        - already-final segment: finals are durable, nothing may follow;
-        - lower revision: stale, even if marked final — finalizing on it
-          would durably bind the segment to older text than clients already
-          displayed;
-        - same revision, provisional: duplicate.
-        Everything else is stored and delivered: a first-seen segment, a
-        strictly newer revision, or a final at exactly the stored provisional
-        revision — a source may legally promote the last provisional in
-        place, so that final is delivered (once) and the segment closes.
-        """
+        """Atomically record accepted revisions for delivery."""
         seg = update.segment
+        # A full source replay is indistinguishable from a new stream here.
         if (
             not self._stream_started
             and seg == 1
@@ -210,6 +148,7 @@ class SessionState:
             return False
         stored = self._segments.get(seg)
         if stored is not None:
+            # A final is durable; older revisions cannot replace newer text.
             revision, final = stored
             if final:
                 self._dropped_post_final += 1
@@ -300,6 +239,7 @@ class SessionState:
         # `_reopenable`), so the cap bounds state without losing finals; only
         # its provisional revision history is forgotten, which risks at most
         # re-relaying a replayed provisional, never a duplicate final.
+        # Previously unseen segments below a forced watermark can lose finals.
         for seg in sorted(self._segments):
             if len(self._segments) <= self.MAX_TRACKED_SEGMENTS:
                 break
@@ -506,7 +446,7 @@ class ClientState:
     MAX_PROVISIONAL_HOLD = 1.0
     MAX_RECOVERY_FRAGMENTS = 32
 
-    def __init__(self, ws, *, fragment_checkpoints: bool = False) -> None:
+    def __init__(self, ws: Any, *, fragment_checkpoints: bool = False) -> None:
         self.ws = ws
         self.fragment_checkpoints = fragment_checkpoints
         self.pending: deque[tuple[CaptionUpdate, int, float, int]] = deque()
@@ -789,8 +729,10 @@ class ClientState:
         self.send_started = time.monotonic()
         self.in_flight_sequence = sequence
         try:
+            # Avoid a compressed empty final fragment at the receiver byte limit.
             if (self.fragment_checkpoints and
-                    (self.provisional_hold or self._checkpoint_due(size, self.send_started))):
+                    (self.provisional_hold or self._checkpoint_due(size, self.send_started)) and
+                    size != MAX_HISTORY_MESSAGE_BYTES):
                 # Frame-based peer queues then hold fewer complete captions.
                 # recv() still returns the identical single JSON message.
                 step = max(1, (len(payload) + self.MAX_RECOVERY_FRAGMENTS - 1)
@@ -892,7 +834,7 @@ async def ingest_caption_update(update: CaptionUpdate) -> None:
         client.offer(update, size)
 
 
-async def handle_source(ws, hello: dict[str, Any]) -> None:
+async def handle_source(ws: Any, hello: dict[str, Any]) -> None:
     # The session value is logged but not required: the server runs a single
     # session, SOURCE_HELLO's type already routes the connection, and refusing
     # the only source over a missing label would stop every caption.
@@ -931,14 +873,15 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
         print(f"source disconnected: {SESSION.drop_summary()}", flush=True)
 
 
-async def handle_client(ws, hello: dict[str, Any]) -> None:
+async def handle_client(ws: Any, hello: dict[str, Any]) -> None:
     client_id = hello.get("client_id")
     last_segment = hello.get("last_segment", 0)
     last_revision = hello.get("last_revision", 0)
     last_segment = last_segment if _is_positive_int(last_segment) else 0
     last_revision = last_revision if _is_positive_int(last_revision) else 0
     seconds = _finite_float(hello.get("history_seconds"))
-    seconds = 30 if seconds is None else min(60, max(0, seconds))
+    seconds = (DEFAULT_HISTORY_SECONDS if seconds is None
+               else min(MAX_HISTORY_SECONDS, max(0, seconds)))
     # Snapshot and registration are synchronous. The sender owns HISTORY and
     # every subsequent live send; source ingestion never waits for either.
     items = SESSION.history_items(last_segment, last_revision, seconds)
@@ -993,7 +936,7 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
               f"reason={client.failure_reason!r}", flush=True)
 
 
-async def handler(ws) -> None:
+async def handler(ws: Any) -> None:
     try:
         raw = await asyncio.wait_for(ws.recv(), timeout=5)
         hello = json.loads(raw)

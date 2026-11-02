@@ -5,3 +5,12 @@ __pycache__/
 .DS_Store
 results/
 *.log
+demo_results*.csv
+demo_results*.json
+bonus_asr/**/*.pt
+bonus_asr/**/*.pth
+bonus_asr/**/*.ckpt
+bonus_asr/**/*.onnx
+bonus_asr/**/*.safetensors
+bonus_asr/**/*.bin
+bonus_asr/**/*.gguf

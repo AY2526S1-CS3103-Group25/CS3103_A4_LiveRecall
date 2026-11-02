@@ -310,7 +310,99 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
                                  expected)
 
 
+def boundary_caption(size):
+    """Make a valid caption with an exact compact UTF-8 JSON size."""
+    msg = {"type": "CAPTION_UPDATE", "session": "L1", "segment": 1,
+           "revision": 1, "source_ts": 1000, "final": True, "text": "é"}
+    raw = json.dumps(msg, ensure_ascii=False, separators=(',', ':'))
+    msg['text'] += 'x' * (size - len(raw.encode('utf-8')))
+    raw = json.dumps(msg, ensure_ascii=False, separators=(',', ':'))
+    assert len(raw.encode('utf-8')) == size
+    return msg, raw
+
+
 class WebSocketRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(tuple(map(int, server.websockets.__version__.split('.')[:2])) >= (17, 3),
+                         'fragmented receivers require websockets 17.3 or newer')
+    async def test_exact_limit_history_and_slow_client_isolation(self):
+        limit = server.MAX_HISTORY_MESSAGE_BYTES
+        wrapper_size = len('{"type":"HISTORY","items":[]}')
+        msg, raw = boundary_caption(limit - wrapper_size)
+        state = server.SessionState()
+        state.apply(server.parse_caption_update(msg, raw))
+        blocked, release = asyncio.Event(), asyncio.Event()
+        original_send = server.ClientState._send
+
+        async def hold_slow(client, payload, sequence=0):
+            if client.ws.request.headers.get('X-Test-Slow') == 'yes' and not release.is_set():
+                blocked.set()
+                await release.wait()
+            return await original_send(client, payload, sequence)
+
+        with (patch.object(server, 'SESSION', state), patch.object(server, 'CLIENTS', {}),
+              patch.object(server.ClientState, '_checkpoint_due', return_value=True),
+              patch.object(server.ClientState, '_send', hold_slow)):
+            async with server.websockets.serve(server.handler, '127.0.0.1', 0) as listener:
+                uri = f"ws://127.0.0.1:{listener.sockets[0].getsockname()[1]}"
+                async with server.websockets.connect(uri, max_size=limit,
+                                                     additional_headers={'X-Test-Slow': 'yes'}) as slow:
+                    await slow.send(json.dumps({'type': 'CLIENT_HELLO', 'history_seconds': 60}))
+                    await asyncio.wait_for(blocked.wait(), 5)
+                    try:
+                        async with server.websockets.connect(uri, max_size=limit) as normal:
+                            await normal.send(json.dumps({'type': 'CLIENT_HELLO', 'history_seconds': 60}))
+                            history = await asyncio.wait_for(normal.recv(), 5)
+                            self.assertEqual(len(history.encode('utf-8')), limit)
+                            self.assertEqual(json.loads(history)['items'][0]['text'], msg['text'])
+                            await server.ingest_caption_update(caption(2))
+                            slow_state = next(c for c in server.CLIENTS.values()
+                                              if c.ws.request.headers.get('X-Test-Slow') == 'yes')
+                            self.assertLessEqual(len(slow_state.pending), slow_state.MAX_PENDING)
+                            self.assertLessEqual(slow_state.pending_bytes, slow_state.MAX_PENDING_BYTES)
+                            self.assertEqual(json.loads(await asyncio.wait_for(normal.recv(), 5))['segment'], 2)
+                            release.set()
+                            self.assertEqual(len((await asyncio.wait_for(slow.recv(), 5)).encode('utf-8')), limit)
+                            self.assertEqual(json.loads(await asyncio.wait_for(slow.recv(), 5))['segment'], 2)
+                    finally:
+                        release.set()
+
+    @unittest.skipUnless(tuple(map(int, server.websockets.__version__.split('.')[:2])) >= (17, 3),
+                         'fragmented receivers require websockets 17.3 or newer')
+    async def test_exact_limit_live_caption_after_empty_history(self):
+        limit = server.MAX_HISTORY_MESSAGE_BYTES
+        msg, raw = boundary_caption(limit)
+        for compression in ('deflate', None):
+            with (self.subTest(compression=compression),
+                  patch.object(server, 'SESSION', server.SessionState()),
+                  patch.object(server, 'CLIENTS', {}),
+                  patch.object(server.ClientState, '_checkpoint_due', return_value=True)):
+                async with server.websockets.serve(server.handler, '127.0.0.1', 0) as listener:
+                    uri = f"ws://127.0.0.1:{listener.sockets[0].getsockname()[1]}"
+                    async with server.websockets.connect(uri, max_size=limit,
+                                                         compression=compression) as ws:
+                        await ws.send(json.dumps({'type': 'CLIENT_HELLO', 'history_seconds': 60}))
+                        self.assertEqual(json.loads(await asyncio.wait_for(ws.recv(), 5))['items'], [])
+                        await server.ingest_caption_update(server.parse_caption_update(msg, raw))
+                        received = await asyncio.wait_for(ws.recv(), 5)
+                        self.assertEqual(len(received.encode('utf-8')), limit)
+                        self.assertEqual(json.loads(received)['text'], msg['text'])
+
+    def test_history_caption_wrapper_boundaries(self):
+        limit = server.MAX_HISTORY_MESSAGE_BYTES
+        wrapper_size = len('{"type":"HISTORY","items":[]}')
+        for total in (limit - 1, limit + 1):
+            with self.subTest(wrapper_bytes=total):
+                msg, _ = boundary_caption(total - wrapper_size)
+                messages = [json.loads(x) for x in server.history_messages([msg])]
+                if total < limit:
+                    self.assertEqual(messages[0]['items'], [msg])
+                else:
+                    self.assertEqual(messages[0]['items'], [])
+                    self.assertEqual(messages[1], msg)
+        msg, _ = boundary_caption(limit + 1)
+        with self.assertRaisesRegex(ValueError, 'exceeds the receiver message limit'):
+            list(server.history_messages([msg]))
+
     async def test_large_history_fits_real_receiver_then_continues_live(self):
         state = server.SessionState()
         for segment in range(1, 20001):

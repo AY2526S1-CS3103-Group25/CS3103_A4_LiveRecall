@@ -334,6 +334,25 @@ test("an emptied park buffer does not let a stale gap age skip recoverable final
   assert.equal(hello.last_segment, 1, "cursor jumped over never-received finals");
 });
 
+test("an expired gap advances over parked finals but stops at the next gap", () => {
+  const c = client();
+  c.open();
+  c.send(1, 1, true);
+  c.advance(1000);
+  c.send(3, 1, true);
+  c.advance(20_000);
+  c.send(4, 2, true);
+  c.send(5, 3, true);
+  c.advance(10_000);
+  c.send(7, 1, true);
+  c.advance(45_000); // the old gap and segment 3 expire, but 4, 5 and 7 remain
+  c.close();
+  c.advance(1000);
+  c.open();
+  const hello = c.sockets[c.sockets.length - 1].sent[0];
+  assert.deepEqual([hello.last_segment, hello.last_revision], [5, 3]);
+});
+
 test("recurring gaps stay bounded: parked finals expire on their own age", () => {
   const c = client();
   c.open();
