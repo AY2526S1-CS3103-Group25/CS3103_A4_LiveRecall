@@ -4,12 +4,7 @@ CS3103 Assignment 4 - LiveRecall revision-aware caption server.
 
 Bounded recent history and per-client delivery preserve finalized captions while
 coalescing obsolete provisional revisions only when a client falls behind.
-
-Required evaluator command:
-    python solution_server.py --port 8765
-
-Teams should replace or substantially extend the implementation while keeping
-this command-line interface and the protocol in the assignment specification.
+Evaluator command: python solution_server.py --port 8765
 """
 
 from __future__ import annotations
@@ -35,6 +30,10 @@ CLIENTS: dict[Any, ClientState] = {}
 MAX_HISTORY_MESSAGE_BYTES = 2**20
 DEFAULT_HISTORY_SECONDS = 30
 MAX_HISTORY_SECONDS = 60
+
+
+def log(*args: Any) -> None:
+    print(*args, flush=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,10 +107,7 @@ class SessionState:
         one, the segment-1 fallback in apply() catches it.
         """
         if self._done:
-            print(
-                f"new source after SOURCE_DONE: resetting ({self.drop_summary()})",
-                flush=True,
-            )
+            log(f"new source after SOURCE_DONE: resetting ({self.drop_summary()})")
             self.__init__()
         self._stream_started = False
 
@@ -130,11 +126,8 @@ class SessionState:
             and self._closed_up_to >= 1
             and 1 not in self._reopenable
         ):
-            print(
-                "stream opens at segment 1 revision 1 but segment 1 is closed: "
-                f"treating as a new stream, resetting ({self.drop_summary()})",
-                flush=True,
-            )
+            log("stream opens at segment 1 revision 1 but segment 1 is closed: "
+                f"treating as a new stream, resetting ({self.drop_summary()})")
             self.__init__()
         self._stream_started = True
         if seg <= self._closed_up_to:
@@ -184,10 +177,8 @@ class SessionState:
     ) -> list[dict[str, Any]]:
         """Snapshot missed finals in segment order, within receipt time.
 
-        The cursor reports the latest finalized state held by the client.
-        Use the same monotonic receipt clock for retention and selection: source
-        and server wall clocks need not agree. Original timestamps and extra
-        fields remain unchanged in the response.
+        Retention and selection use the same monotonic receipt clock: source
+        and server wall clocks need not agree.
         """
         self.prune_history()
         if history_seconds <= 0:
@@ -266,10 +257,9 @@ def _is_positive_int(value: Any) -> bool:
 def _finite_float(value: Any) -> float | None:
     """Coerce a JSON number to a finite float, or None if it is not one.
 
-    JSON integers have arbitrary precision, so the conversion to a C double
-    can itself overflow (`float(10 ** 400)` raises OverflowError, and so does
-    `math.isfinite` on the same value). The guard keeps an absurd timestamp a
-    dropped field rather than an exception that would kill the connection.
+    Arbitrary-precision JSON integers can overflow the conversion itself
+    (`float(10 ** 400)` raises OverflowError); keep that a dropped field
+    rather than an exception that would kill the connection.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -283,14 +273,10 @@ def _finite_float(value: Any) -> float | None:
 def _decode_source_frame(raw: str | bytes) -> tuple[Any, str]:
     """Decode a source frame into (message, payload to forward).
 
-    `json.loads` accepts the JavaScript-only `NaN`/`Infinity`/`-Infinity`
-    literals and `json.dumps` re-emits them, but they are not valid JSON:
-    a browser's `JSON.parse` rejects the entire frame, so a caption carrying
-    one in any field — including an unknown extra one we never look at —
-    would be lost. Large exponents such as 1e400 also decode to infinity in
-    Python and can become invalid JSON when another field is patched. Both
-    cases are replaced with null before re-serialization. Ordinary text frames
-    retain their original payload.
+    Python's json accepts `NaN`/`Infinity` literals (and 1e400 decodes to
+    infinity), but a browser's `JSON.parse` rejects the whole frame — the
+    caption would be lost. Non-finite numbers in any field are rewritten to
+    null before re-serialization; ordinary frames keep their original payload.
     """
     if isinstance(raw, bytes):
         # Keep the decoder's existing acceptance of a UTF-8 BOM.
@@ -311,24 +297,18 @@ def _decode_source_frame(raw: str | bytes) -> tuple[Any, str]:
     )
     if not seen:
         return msg, raw
-    print(f"rewrote non-finite number(s) to null: {', '.join(seen)}", flush=True)
+    log(f"rewrote non-finite number(s) to null: {', '.join(seen)}")
     return msg, json.dumps(msg, allow_nan=False)
 
 
 def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
     """Validate a decoded CAPTION_UPDATE; return None (and log) if malformed.
 
-    Shape validation only: segment/revision monotonicity is session state,
-    not ingestion. Extra/unknown fields are ignored. Never raises.
-
-    The identity fields (segment, revision, final) are strict: without them
-    the update cannot be displayed or deduplicated. source_ts (only used for
-    age metrics) and text (display content) are lenient — a missing/invalid
-    value is defaulted and the payload patched, because dropping a possibly
-    final caption over a non-identity field is unrecoverable. The update's
-    `session` field is not checked: the session is identified by the source
-    connection's SOURCE_HELLO, and the spec doesn't require per-update
-    session matching.
+    Shape validation only: extra/unknown fields are ignored; never raises.
+    Identity fields (segment, revision, final) are strict — without them the
+    update cannot be displayed or deduplicated. source_ts and text are
+    lenient (defaulted, payload patched), because dropping a possibly final
+    caption over a non-identity field is unrecoverable.
     """
     reason = None
     segment = msg.get("segment")
@@ -344,7 +324,7 @@ def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
         reason = f"final must be a bool, got {final!r}"
 
     if reason is not None:
-        print(f"dropping malformed CAPTION_UPDATE: {reason}", flush=True)
+        log(f"dropping malformed CAPTION_UPDATE: {reason}")
         return None
 
     source_ts = _finite_float(msg.get("source_ts"))
@@ -359,11 +339,8 @@ def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
     payload = raw
     if patched:
         payload = json.dumps({**msg, **patched})
-        print(
-            f"CAPTION_UPDATE segment={segment} revision={revision}: "
-            f"defaulted missing/invalid {', '.join(patched)}",
-            flush=True,
-        )
+        log(f"CAPTION_UPDATE segment={segment} revision={revision}: "
+            f"defaulted missing/invalid {', '.join(patched)}")
 
     return CaptionUpdate(
         segment=segment, revision=revision, final=final, payload=payload
@@ -371,12 +348,11 @@ def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
 
 
 def history_messages(items: list[dict[str, Any]]) -> Iterator[str]:
-    """Emit lossless recovery batches before live delivery, one message at a time.
+    """Emit lossless recovery batches; always yields at least one HISTORY.
 
-    The 70-second retention window is unchanged. Batching bounds wire messages
-    rather than throwing away finals to make the whole window fit one message.
-    An item that fits alone but not inside HISTORY uses CAPTION_UPDATE after an
-    initial HISTORY reply; the existing client accept path handles either form.
+    Batching bounds wire messages rather than throwing away finals. An item
+    that fits alone but not inside the HISTORY wrapper is sent as a bare
+    CAPTION_UPDATE after an initial HISTORY reply.
     """
     prefix, suffix = '{"type":"HISTORY","items":[', ']}'
     empty_size = len(prefix) + len(suffix)
@@ -408,10 +384,11 @@ def history_messages(items: list[dict[str, Any]]) -> Iterator[str]:
 
 
 class ClientState:
-    # Live pending work is capped by count and UTF-8 bytes. The initial recovery
-    # snapshot shares retained records; it is encoded one bounded batch at a time.
-    # The snapshot references and one in-flight frame are outside the live budget.
-    # Oversized valid frames use catch-up's single-frame path, never the queue.
+    """Per-client bounded delivery: pending live work is capped by count and
+    UTF-8 bytes; the recovery snapshot shares retained records and is encoded
+    one bounded batch at a time; oversized valid frames use catch-up's
+    single-frame path, never the queue."""
+
     MAX_PENDING = 128
     MAX_PENDING_BYTES = 256 * 1024
     LAG_SECONDS = 0.100
@@ -572,7 +549,7 @@ class ClientState:
             # input. The connection's receive task may not have finished yet.
             self.failed.set()
         except Exception as exc:
-            print(f"client checkpoint failed: {exc!r}", flush=True)
+            log(f"client checkpoint failed: {exc!r}")
             self.fail("Peer checkpoint failed; reconnect")
 
     async def _delivery_checkpoint(self, size: int) -> None:
@@ -821,7 +798,7 @@ async def handle_source(ws: Any, hello: dict[str, Any]) -> None:
     # session, SOURCE_HELLO's type already routes the connection, and refusing
     # the only source over a missing label would stop every caption.
     session = hello.get("session")
-    print(f"source connected: session={session!r}", flush=True)
+    log(f"source connected: session={session!r}")
     SESSION.on_source_connect()
 
     try:
@@ -845,14 +822,14 @@ async def handle_source(ws: Any, hello: dict[str, Any]) -> None:
             elif msg_type == "SOURCE_DONE":
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
-                print(f"source finished: segments={msg.get('segments')}", flush=True)
+                log(f"source finished: segments={msg.get('segments')}")
                 SESSION.on_source_done()
             else:
                 # Forward compatibility: ignore fields/messages this baseline
                 # doesn't understand rather than crashing.
                 continue
     finally:
-        print(f"source disconnected: {SESSION.drop_summary()}", flush=True)
+        log(f"source disconnected: {SESSION.drop_summary()}")
 
 
 async def handle_client(ws: Any, hello: dict[str, Any]) -> None:
@@ -886,7 +863,7 @@ async def handle_client(ws: Any, hello: dict[str, Any]) -> None:
 
     reader = asyncio.create_task(receive())
     failure = asyncio.create_task(client.failed.wait())
-    print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+    log(f"client connected: id={client_id}; clients={len(CLIENTS)}")
     try:
         done, _ = await asyncio.wait(
             (sender, reader, failure), return_when=asyncio.FIRST_COMPLETED
@@ -896,7 +873,7 @@ async def handle_client(ws: Any, hello: dict[str, Any]) -> None:
     except ConnectionClosed:
         pass
     except Exception as exc:
-        print(f"client delivery failed: {exc!r}", flush=True)
+        log(f"client delivery failed: {exc!r}")
         client.fail("Client delivery failed; reconnect")
         raise
     finally:
@@ -913,9 +890,9 @@ async def handle_client(ws: Any, hello: dict[str, Any]) -> None:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-        print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}; "
-              f"coalesced={client.coalesced}; catch_ups={client.catch_ups}; "
-              f"reason={client.failure_reason!r}", flush=True)
+        log(f"client disconnected: id={client_id}; clients={len(CLIENTS)}; "
+            f"coalesced={client.coalesced}; catch_ups={client.catch_ups}; "
+            f"reason={client.failure_reason!r}")
 
 
 async def handler(ws: Any) -> None:
@@ -958,7 +935,7 @@ async def main_async(port: int) -> None:
         ping_interval=20,
         ping_timeout=20,
     ):
-        print(f"LiveRecall listening on ws://0.0.0.0:{port}", flush=True)
+        log(f"LiveRecall listening on ws://0.0.0.0:{port}")
         cleanup = asyncio.create_task(prune_history_periodically())
         try:
             await asyncio.Future()
