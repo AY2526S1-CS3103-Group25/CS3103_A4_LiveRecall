@@ -1,37 +1,13 @@
 #!/usr/bin/env python3
 """Cuttable TCP proxy in front of the LiveRecall server, for disconnect demos.
 
-Ctrl-C on the server is a poor disconnect: it also kills caption_source.py
-(the starter source has no reconnect) and discards the server's recent
-history, so there is nothing left for a reconnecting client to recover. This
-proxy breaks only the browser clients' path. The server process, its history,
-and the source connection all survive, which is what makes recovery visible.
+Ctrl-C on the server is a poor disconnect: it also kills caption_source.py and
+discards the history a reconnecting client would recover. The proxy breaks only
+the browser clients' path (it takes over the port the browser already dials),
+so the server, its history, and the source connection all survive.
 
-The proxy takes over the port the browser already dials, so client/app.js
-needs no change:
-
-  python solution_server.py --port 8799                  # real server
-  python cut_proxy.py --listen 8765 --target 8799        # the cuttable path
-  python -m http.server 8000 --directory client
-  python caption_source.py --uri ws://127.0.0.1:8799     # source bypasses it
-  browser -> http://127.0.0.1:8000  (dials ws://127.0.0.1:8765)
-
-Commands typed at the proxy's terminal:
-
-  cut     close live connections; clients reconnect immediately
-  down    close them and stop listening, so redials are refused as well
-  up      listen again; clients reconnect and recover what they missed
-  freeze  keep sockets open but relay nothing, which is a silently dead path:
-          the tab still reports "connected" because no close ever arrives
-  thaw    resume relaying
-  status  print mode and live connection count
-  quit    exit
-
-Use `down`, wait, then `up` for an outage long enough that finalized captions
-accumulate; `cut` alone only exercises the reconnect, not the recovery.
-
-Once stdin reaches end of input (nohup, a closed pipe, CI) the proxy just
-relays until it is killed.
+Port layout and the stdin command reference (cut / down / up / freeze / thaw /
+status / quit) live in DEMO_GUIDE.md under "Disconnect / recovery demo".
 """
 
 from __future__ import annotations
@@ -43,12 +19,17 @@ import sys
 BUFFER_BYTES = 65536
 
 
+def log(*args) -> None:
+    print(*args, flush=True)
+
+
 class Link:
     """A client connection and the upstream connection paired with it."""
 
-    def __init__(self, client_w: asyncio.StreamWriter, server_w: asyncio.StreamWriter) -> None:
+    def __init__(self, client_w: asyncio.StreamWriter, server_w: asyncio.StreamWriter,
+                 pumps: list[asyncio.Task]) -> None:
         self.writers = (client_w, server_w)
-        self.pumps: list[asyncio.Task] = []
+        self.pumps = pumps
 
     def close(self) -> None:
         # Cancel before closing: a pump held at the freeze gate is not
@@ -70,8 +51,6 @@ class CutProxy:
         self.relaying.set()
         self.server: asyncio.Server | None = None
 
-    # --- relaying ---------------------------------------------------------
-
     async def _pump(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             while True:
@@ -86,7 +65,7 @@ class CutProxy:
                 await self.relaying.wait()
                 writer.write(data)
                 await writer.drain()
-        except (ConnectionError, asyncio.IncompleteReadError):
+        except ConnectionError:
             pass
         finally:
             if not writer.is_closing():
@@ -96,25 +75,21 @@ class CutProxy:
         try:
             server_r, server_w = await asyncio.open_connection("127.0.0.1", self.target_port)
         except OSError as exc:
-            print(f"[proxy] upstream connect failed: {exc}", flush=True)
+            log(f"[proxy] upstream connect failed: {exc}")
             client_w.close()
             return
-        link = Link(client_w, server_w)
-        link.pumps = [
+        link = Link(client_w, server_w, [
             asyncio.create_task(self._pump(client_r, server_w)),
             asyncio.create_task(self._pump(server_r, client_w)),
-        ]
+        ])
         self.links.append(link)
-        print(f"[proxy] connection open; live={len(self.links)}", flush=True)
+        log(f"[proxy] connection open; live={len(self.links)}")
         try:
             await asyncio.gather(*link.pumps, return_exceptions=True)
         finally:
-            if link in self.links:
-                self.links.remove(link)
+            self.links.remove(link)
             link.close()
-            print(f"[proxy] connection closed; live={len(self.links)}", flush=True)
-
-    # --- commands ---------------------------------------------------------
+            log(f"[proxy] connection closed; live={len(self.links)}")
 
     def cut(self) -> int:
         count = len(self.links)
@@ -126,11 +101,8 @@ class CutProxy:
         if self.server is not None:
             return
         self.server = await asyncio.start_server(self._handle, "127.0.0.1", self.listen_port)
-        print(
-            f"[proxy] listening on 127.0.0.1:{self.listen_port}"
-            f" -> 127.0.0.1:{self.target_port}",
-            flush=True,
-        )
+        log(f"[proxy] listening on 127.0.0.1:{self.listen_port}"
+            f" -> 127.0.0.1:{self.target_port}")
 
     async def down(self) -> None:
         # Cut before awaiting wait_closed(): since 3.12 it waits for every
@@ -141,12 +113,12 @@ class CutProxy:
             self.server.close()
             await self.server.wait_closed()
             self.server = None
-        print(f"[proxy] not listening; cut {count} connection(s)", flush=True)
+        log(f"[proxy] not listening; cut {count} connection(s)")
 
     def status(self) -> None:
         mode = "relaying" if self.relaying.is_set() else "frozen"
         listening = "listening" if self.server is not None else "not listening"
-        print(f"[proxy] {mode}; {listening}; live={len(self.links)}", flush=True)
+        log(f"[proxy] {mode}; {listening}; live={len(self.links)}")
 
     async def run_commands(self) -> bool:
         """Read commands until `quit` (True) or end of input (False).
@@ -161,23 +133,23 @@ class CutProxy:
                 return False
             command = line.strip().lower()
             if command == "cut":
-                print(f"[proxy] cut {self.cut()} connection(s)", flush=True)
+                log(f"[proxy] cut {self.cut()} connection(s)")
             elif command == "down":
                 await self.down()
             elif command == "up":
                 await self.up()
             elif command == "freeze":
                 self.relaying.clear()
-                print("[proxy] frozen: sockets open, nothing relayed", flush=True)
+                log("[proxy] frozen: sockets open, nothing relayed")
             elif command == "thaw":
                 self.relaying.set()
-                print("[proxy] relaying again", flush=True)
+                log("[proxy] relaying again")
             elif command == "status":
                 self.status()
             elif command in {"quit", "exit"}:
                 return True
             elif command:
-                print(f"[proxy] unknown command: {command}", flush=True)
+                log(f"[proxy] unknown command: {command}")
 
 
 async def main_async(listen_port: int, target_port: int) -> None:
@@ -186,7 +158,7 @@ async def main_async(listen_port: int, target_port: int) -> None:
     if not await proxy.run_commands():
         # Nothing more will be typed (nohup, a closed pipe, CI): keep relaying
         # until the process is killed, which is itself the cut in that mode.
-        print("[proxy] no more input; relaying until killed", flush=True)
+        log("[proxy] no more input; relaying until killed")
         await asyncio.Future()
     await proxy.down()
 
