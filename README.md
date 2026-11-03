@@ -4,10 +4,10 @@
 
 | Name | Student ID | Main responsibility |
 |---|---|---|
-| Leong Wei Zhi (@LeongWZ) | TODO(team) | Server: protocol ingestion and revision dedup, backpressure checkpoints, reconnect backoff |
-| Yong Quan (@yongqqqq) | TODO(team) | Server: bounded history and resume, delivery isolation, overload handling |
-| Kai Ming (@CloudKai) | TODO(team) | Browser client: live display, validation, local recall |
-| Zhan Wen (@panomia01) | TODO(team) | Experiments: public tests T1-T5, Ubuntu evidence, before/after comparison |
+| Leong Wei Zhi (@LeongWZ) | A0272890W | Server: protocol ingestion and revision dedup, backpressure checkpoints, reconnect backoff |
+| Yong Quan (@yongqqqq) | A0273309A | Server: bounded history and resume, delivery isolation, overload handling |
+| Kai Ming (@CloudKai) | A0273527Y | Browser client: live display, validation, local recall |
+| Zhan Wen (@panomia01) | A0273420N | Experiments: public tests T1-T5, Ubuntu evidence, before/after comparison |
 
 ## Ubuntu setup
 
