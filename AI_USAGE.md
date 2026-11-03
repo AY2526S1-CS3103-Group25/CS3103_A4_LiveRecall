@@ -184,6 +184,34 @@ On the further pass, Codex reconsidered the earlier decision to leave the duplic
 
 For the exact-limit fix, Codex initially considered reserving space only in HISTORY batching. A real WebSocket probe showed an equally sized standalone live caption could fail the same way, so the accepted change instead uses the common sender's existing unfragmented path at exactly 1 MiB. The boundary tests use UTF-8 byte sizes and reproduced the original failure before the fix; blocked-sender isolation is simulated, while actual slow-reader behavior is measured separately.
 
+## Demo-editability cleanup (3 November 2026, issue #40)
+
+Claude Code (Fable 5) planned and executed a second cleanup pass focused on
+viva-time editability, continuing where the 2 November audit stopped. Three
+exploration passes mapped the code, the test coupling surface (module names and
+attributes the suites patch), and a do-not-touch list of load-bearing code that
+looks redundant (fairness yields, the two-stage pong wait, the deque rotate,
+reconnect race guards); nothing on that list was changed. The applied changes:
+never-read `CaptionUpdate.source_ts`/`text` fields, unreachable `isinstance`
+size branches, dead hello defaults, a duplicated 1008 close, and delegation-only
+properties removed; a `log()` helper replacing the repeated `flush=True` prints
+in the server and `cut_proxy.py`; restated docstrings compressed with each
+stated invariant kept; four small named extractions (`_is_new_stream`,
+`_wants_fragments`, `_aborted`, `_drain_history`) with sequencing unchanged;
+README/DEMO_GUIDE corrected where they still described the starter client, and
+the cut_proxy command reference moved into DEMO_GUIDE with a where-to-tweak
+table. A hot-path `_observe_pong` extraction was considered and rejected
+because #38 had just reworked checkpoint pacing. A real reconnect-backoff bug
+found during exploration (backoff resets to ~1s during outages over 10 s) was
+deliberately excluded as a behavior change and filed as issue #41.
+
+**Verification:** all 57 server regressions (2 version-gated skips on
+websockets 16.1.1), 15 client regressions, and the startup check passed after
+every commit; `cut_proxy.py` was smoke-tested live, including a relayed
+`CLIENT_HELLO`/`HISTORY` exchange with correct link accounting through `cut`
+and teardown; a T1 `run_demo` pair (before branching vs. branch tip) retained
+100% completeness and coverage with zero duplicate/stale/connection errors.
+
 ## Responsibility statement
 
 We understand that the team remains responsible for the submitted code, experimental results, and claims, and that every member may be asked to explain or modify relevant code during the viva.
