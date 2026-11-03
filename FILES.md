@@ -10,5 +10,7 @@
 - `network_profiles/` - public `tc/netem` examples.
 - `START_HERE.md`, `DEMO_GUIDE.md`, `PUBLIC_TESTS.md`, `PROTOCOL_EXAMPLES.md`, `NETWORKING_PRIMER.md`, `UBUNTU_SETUP.md` - student guides.
 - `submission_check.py` - startup/WebSocket compatibility checker; `--final` checks final deliverables.
-- `README_TEMPLATE.md`, `AI_USAGE_TEMPLATE.md`, `CONTRIBUTIONS_TEMPLATE.md` - submission templates.
+- `README.md`, `AI_USAGE.md`, `CONTRIBUTIONS.md` - submission deliverables (filled from the former templates).
+- `cut_proxy.py` - team-built cuttable TCP proxy for the disconnect/recovery demo (see `DEMO_GUIDE.md`).
+- `docs/` - team docs: `PUBLIC_TESTS_GUIDE.md` (verified Ubuntu T1-T5 results), `safe_cleanup_audit.md`, and `evidence/` (committed verification summaries).
 - `bonus_asr/` - optional-only bonus guidance.

@@ -1,0 +1,11 @@
+Ubuntu 24.04.1 LTS
+6.8.0-41-generic
+Python 3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]
+websockets==17.4
+86b2bb13b6801e0b81fc59abc5b64064f20012f6
+?? t5_run01.csv
+?? t5_run01.json
+?? t5_run02.csv
+?? t5_run02.json
+?? t5_run03.csv
+?? t5_run03.json
