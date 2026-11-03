@@ -5,9 +5,9 @@
 | Name | Student ID | Main responsibility |
 |---|---|---|
 | Leong Wei Zhi (@LeongWZ) | A0272890W | Server: protocol ingestion and revision dedup, backpressure checkpoints, reconnect backoff |
-| Yong Quan (@yongqqqq) | A0273309A | Server: bounded history and resume, delivery isolation, overload handling |
-| Kai Ming (@CloudKai) | A0273527Y | Browser client: live display, validation, local recall |
-| Zhan Wen (@panomia01) | A0273420N | Experiments: public tests T1-T5, Ubuntu evidence, before/after comparison |
+| Tan Yong Quan (@yongqqqq) | A0273309A | Server: bounded history and resume, delivery isolation, overload handling |
+| Boon Kai Ming (@CloudKai) | A0273527Y | Browser client: live display, validation, local recall |
+| Ng Zhan Wen (@panomia01) | A0273420N | Experiments: public tests T1-T5, Ubuntu evidence, before/after comparison |
 
 ## Ubuntu setup
 
