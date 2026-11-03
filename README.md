@@ -264,6 +264,10 @@ in T5 run 03 one client lacked one final segment at collection end
 
 ## Mandatory deterministic application demo
 
+The recorded 5-7 minute demo video is [`demo_video.mp4`](demo_video.mp4)
+(5:26, covering issue #15's scenes: live revisions, What did I miss?,
+disconnect/recovery, late join).
+
 No ASR setup is required; captions come from the deterministic
 `caption_source.py`. The full walkthrough is in `DEMO_GUIDE.md`; summary:
 
