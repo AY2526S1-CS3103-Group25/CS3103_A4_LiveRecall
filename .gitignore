@@ -7,6 +7,8 @@ results/
 *.log
 demo_results*.csv
 demo_results*.json
+results.csv
+memory_rss.csv
 bonus_asr/**/*.pt
 bonus_asr/**/*.pth
 bonus_asr/**/*.ckpt
