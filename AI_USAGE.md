@@ -15,6 +15,10 @@ draft parts of the caption display logic, and identify edge cases. Proposed
 changes were evaluated against the assignment's revision rules, bounded-state
 requirements, and need for simple, understandable code.
 
+### Report 
+
+AI (Codex, Astra) was used to review the report against the assignment requirements, ensuring that the required sections were written. It helped with grammatical and wording improvements. It also helped clarify technical explanations and suggested possible future implementations/improvements.
+
 ## Useful suggestions
 
 ### Preserving server updates with recoverable field errors
