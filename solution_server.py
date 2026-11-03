@@ -114,18 +114,21 @@ class SessionState:
     def on_source_done(self) -> None:
         self._done = True
 
+    def _is_new_stream(self, update: CaptionUpdate) -> bool:
+        # A provisional s1r1 as a connection's first frame while segment 1 is
+        # already closed can only be a new stream (a full source replay is
+        # indistinguishable from one here).
+        return (not self._stream_started
+                and update.segment == 1
+                and update.revision == 1
+                and not update.final
+                and self._closed_up_to >= 1
+                and 1 not in self._reopenable)
+
     def apply(self, update: CaptionUpdate) -> bool:
         """Atomically record accepted revisions for delivery."""
         seg = update.segment
-        # A full source replay is indistinguishable from a new stream here.
-        if (
-            not self._stream_started
-            and seg == 1
-            and update.revision == 1
-            and not update.final
-            and self._closed_up_to >= 1
-            and 1 not in self._reopenable
-        ):
+        if self._is_new_stream(update):
             log("stream opens at segment 1 revision 1 but segment 1 is closed: "
                 f"treating as a new stream, resetting ({self.drop_summary()})")
             self.__init__()
@@ -614,6 +617,10 @@ class ClientState:
               < SESSION.expired_sequence):
             self.fail("Final recovery window expired; reconnect")
 
+    def _aborted(self) -> bool:
+        self.check_recovery()
+        return self.failed.is_set()
+
     def _observe_lag(self, drop_segment: int | None = None) -> None:
         now = time.monotonic()
         if ((self.send_started is not None
@@ -638,8 +645,7 @@ class ClientState:
                 self.pending = kept
 
     def offer(self, update: CaptionUpdate, size: int) -> None:
-        self.check_recovery()
-        if self.failed.is_set():
+        if self._aborted():
             return
         if self.catch_up:
             self.ready.set()
@@ -667,8 +673,7 @@ class ClientState:
 
     def _next_recovery(self) -> tuple[CaptionUpdate, int] | None:
         SESSION.prune_history()
-        self.check_recovery()
-        if self.failed.is_set():
+        if self._aborted():
             return None
         update = SESSION.final_after(self.final_cursor)
         if update is not None:
@@ -711,16 +716,14 @@ class ClientState:
         # Establish path RTT before HISTORY can fill the peer's receive queue.
         await self._checkpoint(0)
         for message in history_messages(history):
-            self.check_recovery()
-            if self.failed.is_set():
+            if self._aborted():
                 return
             size = await self._send(message)
             await self._delivery_checkpoint(size)
             await asyncio.sleep(0)
         del history, message
         while not self.failed.is_set():
-            self.check_recovery()
-            if self.failed.is_set():
+            if self._aborted():
                 break
             # Pipeline within the measured path RTT, but stop adding transport
             # work when feedback is overdue. This wait doesn't itself classify
@@ -832,6 +835,17 @@ async def handle_source(ws: Any, hello: dict[str, Any]) -> None:
         log(f"source disconnected: {SESSION.drop_summary()}")
 
 
+def _wants_fragments(ws: Any) -> bool:
+    # Older Python websockets receivers can crash when recv() times out during
+    # fragmentation (upstream #1773, fixed in 17.3). This advisory compatibility
+    # guard is not authentication: absent/unknown UAs use the plain-frame policy.
+    request = getattr(ws, 'request', None)
+    headers = request.headers if request is not None else getattr(ws, 'request_headers', {})
+    version = re.search(r'(?:^| )websockets/(\d{1,3})\.(\d{1,3})(?:\.\d{1,3})?(?: |$)',
+                        headers.get('User-Agent', ''))
+    return bool(version and tuple(map(int, version.groups())) >= (17, 3))
+
+
 async def handle_client(ws: Any, hello: dict[str, Any]) -> None:
     client_id = hello.get("client_id")
     last_segment = hello.get("last_segment")
@@ -844,15 +858,7 @@ async def handle_client(ws: Any, hello: dict[str, Any]) -> None:
     # Snapshot and registration are synchronous. The sender owns HISTORY and
     # every subsequent live send; source ingestion never waits for either.
     items = SESSION.history_items(last_segment, last_revision, seconds)
-    # Older Python websockets receivers can crash when recv() times out during
-    # fragmentation (upstream #1773, fixed in 17.3). This advisory compatibility
-    # guard is not authentication: absent/unknown UAs use the plain-frame policy.
-    request = getattr(ws, 'request', None)
-    headers = request.headers if request is not None else getattr(ws, 'request_headers', {})
-    version = re.search(r'(?:^| )websockets/(\d{1,3})\.(\d{1,3})(?:\.\d{1,3})?(?: |$)',
-                        headers.get('User-Agent', ''))
-    fragment_checkpoints = bool(version and tuple(map(int, version.groups())) >= (17, 3))
-    client = ClientState(ws, fragment_checkpoints=fragment_checkpoints)
+    client = ClientState(ws, fragment_checkpoints=_wants_fragments(ws))
     CLIENTS[ws] = client
     sender = asyncio.create_task(client.run(items))
     del items
