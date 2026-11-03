@@ -256,7 +256,9 @@ committed verification summaries under `docs/evidence/`):
 
 All 15 runs recorded zero duplicate/stale deliveries and zero connection
 errors. Two per-run exceptions stay visible even where the median is 100%:
-T1 run 01 delivered 94.70% of provisional revisions (all finals arrived), and
+T1 run 01 delivered 94.70% of expected live revisions (1250/1320; all 440
+finals arrived, so the 70 missing deliveries were provisionals — 810/880 =
+92.05% provisional coverage), and
 in T5 run 03 one client lacked one final segment at collection end
 (4899/4900 expected client-final deliveries). The guide discusses both.
 
