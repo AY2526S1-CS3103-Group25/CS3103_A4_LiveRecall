@@ -49,9 +49,7 @@ class CaptionUpdate:
 
     segment: int
     revision: int
-    source_ts: float
     final: bool
-    text: str
     payload: str
 
 
@@ -85,8 +83,8 @@ class SessionState:
         self._history: deque[tuple[float, CaptionUpdate, dict[str, Any]]] = deque()
         # Receipt-order final positions let senders recover even out-of-order
         # segment finals, without a growing per-client set of delivered IDs.
-        self._final_sequence = 0
-        self._expired_sequence = 0
+        self.final_sequence = 0
+        self.expired_sequence = 0
         self._active: dict[int, CaptionUpdate] = {}
         self.generation = object()
         self._done = False  # previous source completed with SOURCE_DONE
@@ -172,14 +170,14 @@ class SessionState:
     def _remember_final(self, update: CaptionUpdate) -> None:
         self.prune_history()
         self._active.pop(update.segment, None)
-        self._final_sequence += 1
+        self.final_sequence += 1
         self._history.append((time.monotonic(), update, json.loads(update.payload)))
 
     def prune_history(self) -> None:
         cutoff = time.monotonic() - self.HISTORY_RETENTION_SECONDS
         while self._history and self._history[0][0] <= cutoff:
             self._history.popleft()
-            self._expired_sequence += 1
+            self.expired_sequence += 1
 
     def history_items(
         self, last_segment: int, last_revision: int, history_seconds: float
@@ -204,18 +202,10 @@ class SessionState:
             updates, key=lambda entry: entry[0].segment
         )]
 
-    @property
-    def final_sequence(self) -> int:
-        return self._final_sequence
-
-    @property
-    def expired_sequence(self) -> int:
-        return self._expired_sequence
-
     def final_after(self, sequence: int) -> CaptionUpdate | None:
         """Read the next retained final; callers first check expiry."""
-        if sequence < self._final_sequence:
-            return self._history[sequence - self._expired_sequence][1]
+        if sequence < self.final_sequence:
+            return self._history[sequence - self.expired_sequence][1]
         return None
 
     def active_updates(self) -> list[CaptionUpdate]:
@@ -281,7 +271,6 @@ def _finite_float(value: Any) -> float | None:
     `math.isfinite` on the same value). The guard keeps an absurd timestamp a
     dropped field rather than an exception that would kill the connection.
     """
-    # bool is a subclass of int, so it must be rejected explicitly.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     try:
@@ -377,12 +366,7 @@ def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
         )
 
     return CaptionUpdate(
-        segment=segment,
-        revision=revision,
-        source_ts=source_ts,
-        final=final,
-        text=text,
-        payload=payload,
+        segment=segment, revision=revision, final=final, payload=payload
     )
 
 
@@ -622,7 +606,7 @@ class ClientState:
             self.checkpoint_messages += bool(size)
             self.checkpoint_bytes += size
 
-    async def _wait_provisional(self, queued_at: float) -> bool:
+    async def _wait_provisional(self, queued_at: float = 0.0) -> bool:
         if not self.provisional_hold:
             return False
         delay = max(queued_at + self.provisional_hold,
@@ -724,8 +708,7 @@ class ClientState:
         return None
 
     async def _send(self, payload: str, sequence: int = 0) -> int:
-        size = (len(payload.encode('utf-8'))
-                if isinstance(payload, str) else len(payload))
+        size = len(payload.encode('utf-8'))
         self.send_started = time.monotonic()
         self.in_flight_sequence = sequence
         try:
@@ -776,7 +759,7 @@ class ClientState:
             if recovery is not None:
                 update, sequence = recovery
                 if (not update.final
-                        and await self._wait_provisional(0)):
+                        and await self._wait_provisional()):
                     continue
             elif self.pending:
                 if self.provisional_hold:
@@ -828,8 +811,7 @@ async def ingest_caption_update(update: CaptionUpdate) -> None:
     """Commit accepted state and offer work without awaiting client I/O."""
     if not SESSION.apply(update):
         return
-    size = (len(update.payload.encode("utf-8"))
-            if isinstance(update.payload, str) else len(update.payload))
+    size = len(update.payload.encode("utf-8"))
     for client in CLIENTS.values():
         client.offer(update, size)
 
@@ -875,8 +857,8 @@ async def handle_source(ws: Any, hello: dict[str, Any]) -> None:
 
 async def handle_client(ws: Any, hello: dict[str, Any]) -> None:
     client_id = hello.get("client_id")
-    last_segment = hello.get("last_segment", 0)
-    last_revision = hello.get("last_revision", 0)
+    last_segment = hello.get("last_segment")
+    last_revision = hello.get("last_revision")
     last_segment = last_segment if _is_positive_int(last_segment) else 0
     last_revision = last_revision if _is_positive_int(last_revision) else 0
     seconds = _finite_float(hello.get("history_seconds"))
@@ -943,8 +925,7 @@ async def handler(ws: Any) -> None:
     except (asyncio.TimeoutError, ValueError):
         # ValueError covers JSONDecodeError and UnicodeDecodeError (a binary
         # hello frame with invalid UTF-8).
-        await ws.close(code=1008, reason="Expected a valid hello message")
-        return
+        hello = None
     if not isinstance(hello, dict):
         await ws.close(code=1008, reason="Expected a valid hello message")
         return
