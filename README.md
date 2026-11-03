@@ -1,12 +1,45 @@
-# Team XX - LiveRecall
+# Team 25 - LiveRecall
 
 ## Team members
 
-- Name / student ID / responsibility
+| Name | Student ID | Main responsibility |
+|---|---|---|
+| Leong Wei Zhi (@LeongWZ) | TODO(team) | Server: protocol ingestion and revision dedup, backpressure checkpoints, reconnect backoff |
+| Yong Quan (@yongqqqq) | TODO(team) | Server: bounded history and resume, delivery isolation, overload handling |
+| Kai Ming (@CloudKai) | TODO(team) | Browser client: live display, validation, local recall |
+| Zhan Wen (@panomia01) | TODO(team) | Experiments: public tests T1-T5, Ubuntu evidence, before/after comparison |
 
 ## Ubuntu setup
 
-Exact commands from a fresh Ubuntu environment.
+Ubuntu is required for the reproducible performance tests because T5 uses Linux
+`tc/netem`. From a fresh Ubuntu environment (the public results below used
+Ubuntu 24.04.1 LTS, kernel 6.8.0-41, Python 3.12.3, websockets 17.4):
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip iproute2
+```
+
+Verify the tools:
+
+```bash
+python3 --version
+tc -V
+```
+
+On macOS or Windows hosts, an Ubuntu VM via
+[Multipass](https://canonical.com/multipass/install) works:
+
+```bash
+multipass launch --name liverecall --cpus 2 --memory 4G --disk 15G
+multipass shell liverecall
+# then run the apt commands above inside the VM, and `multipass stop liverecall` when done
+```
+
+Run the server and the simulated clients inside the **same** Ubuntu
+environment for the public performance experiments; the supplied impairment
+profiles apply to `lo`. See `UBUNTU_SETUP.md` for details. `ffmpeg` and ASR
+packages are **not** mandatory dependencies.
 
 ## Install
 
@@ -175,25 +208,137 @@ Terminal 3 command again. Reloading clears the previous captions. Press
 
 ## Public deterministic tests
 
-Exact commands and configuration used for T1-T5, including independent runs.
+All five public tests were run on Ubuntu 24.04.1 LTS (kernel 6.8.0-41, Python
+3.12.3, websockets 17.4) at commit `86b2bb1`, with **three independent runs
+each** (`--runs 3` restarts the server per run); every reported value is the
+median of the three runs. Exact commands, from the repo root with the venv
+active:
+
+```bash
+mkdir -p results/ubuntu
+
+# T1 - basic correctness
+python run_demo.py --clients 20 --duration 20 --runs 3 --output-stem results/ubuntu/t1
+
+# T2 - public scale
+python run_demo.py --clients 100 --duration 40 --runs 3 --output-stem results/ubuntu/t2
+
+# T3 - slow readers
+python run_demo.py --clients 100 --duration 60 --runs 3 --slow-percent 10 --slow-ms 500 --output-stem results/ubuntu/t3
+
+# T4 - reconnect
+python run_demo.py --clients 100 --duration 60 --runs 3 --disconnect-percent 20 --disconnect-at 15 --disconnect-seconds 5 --output-stem results/ubuntu/t4
+```
+
+T5 applies the supplied impairment profile to loopback (`delay 120ms 30ms
+distribution normal loss 3%`) and always resets it afterwards:
+
+```bash
+(
+  set -e
+  trap 'sudo bash ./network_profiles/reset.sh lo' EXIT
+  sudo bash ./network_profiles/delay_loss.sh lo
+  python run_demo.py --clients 100 --duration 40 --runs 3 --output-stem results/ubuntu/t5
+)
+```
+
+Median results (Caption Age in milliseconds; full per-run data, metric
+definitions and limits in [docs/PUBLIC_TESTS_GUIDE.md](docs/PUBLIC_TESTS_GUIDE.md),
+committed verification summaries under `docs/evidence/`):
+
+| Test | P50 | P95 | P99 | Fresh updates | Fresh finals | Final completeness | Live coverage |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| T1 | 6.20 | 13.03 | 23.03 | 100.00% | 100.00% | 100.00% | 100.00% |
+| T2 | 13.23 | 23.55 | 27.33 | 100.00% | 100.00% | 100.00% | 100.00% |
+| T3 | 15.33 | 30.46 | 163.70 | 99.79% | 99.57% | 100.00% | 93.90% |
+| T4 | 9.03 | 22.41 | 26.92 | 100.00% | 98.42% | 100.00% | 98.33% |
+| T5 | 311.53 | 800.02 | 1102.49 | 78.61% | 76.16% | 100.00% | 89.00% |
+
+All 15 runs recorded zero duplicate/stale deliveries and zero connection
+errors. Two per-run exceptions stay visible even where the median is 100%:
+T1 run 01 delivered 94.70% of provisional revisions (all finals arrived), and
+in T5 run 03 one client lacked one final segment at collection end
+(4899/4900 expected client-final deliveries). The guide discusses both.
 
 ## Mandatory deterministic application demo
 
-Exact commands/steps for `caption_source.py`, browser clients, revision replacement, recall, late join, and reconnect/recovery.
+No ASR setup is required; captions come from the deterministic
+`caption_source.py`. The full walkthrough is in `DEMO_GUIDE.md`; summary:
+
+1. Terminal 1: `python solution_server.py --port 8765`
+2. Terminal 2: `python3 -m http.server 8000 --directory client`, then open
+   **http://127.0.0.1:8000/** in at least two tabs.
+3. Terminal 3: `python caption_source.py --duration 120` (long mode, so the
+   60-second recall window is meaningful).
+
+Demonstrate: provisional vs final styling, newer revisions replacing the same
+row, the 15/30/60-second local recall windows, a late-joining tab receiving
+recent context via `HISTORY` and then continuing live, and disconnect/recovery.
+
+For disconnect/recovery, use `cut_proxy.py` so the server, its history, and the
+source survive while only the browsers' path breaks:
+
+```bash
+python solution_server.py --port 8799                  # real server
+python cut_proxy.py --listen 8765 --target 8799        # the cuttable path
+python3 -m http.server 8000 --directory client
+python caption_source.py --uri ws://127.0.0.1:8799     # source bypasses the proxy
+```
+
+Type `down` at the proxy, wait for finals to accumulate, then `up`: the tabs
+reconnect with jittered exponential backoff and recover the missed finals
+without duplicates. (`cut` alone only exercises reconnect, not recovery.)
 
 ## Design notes
 
 The local-recall timing and retention decision is documented in the issue #7
-section above; include the client-receipt-time choice in the corresponding PR.
+section above (client receipt time, measured with the monotonic
+`performance.now()` clock).
 
-Briefly describe:
+**Revision/deduplication state.** The server keeps one `(revision, final)`
+watermark per segment (`SessionState` in `solution_server.py`), dropping
+stale, duplicate and post-final updates with per-reason counters. Identity
+fields (`segment`, `revision`, `final`) are validated strictly, while
+recoverable fields (`source_ts`, `text`) are defaulted rather than dropped —
+a dropped final is unrecoverable. The browser mirrors this with its own
+revision guard, so recovery bursts deduplicate through the same accept path.
 
-- revision/deduplication state;
-- bounded server history;
-- reconnect/late-join recovery;
-- per-client buffering/backpressure policy;
-- overload behavior and trade-offs.
+**Bounded server history.** Recent finalized captions are retained for
+`HISTORY_RETENTION_SECONDS = 70` (the required 60-second window plus margin)
+in a receipt-time-ordered deque: O(1) expiry, immune to source clock skew and
+out-of-order finals. Tracked segment metadata is capped
+(`MAX_TRACKED_SEGMENTS = 1024`) so a never-finalizing source cannot grow
+state forever.
+
+**Reconnect/late-join recovery.** `CLIENT_HELLO` carries the client's highest
+contiguous finalized segment/revision; the server replies with ordered
+`HISTORY` batches of at most 1 MiB each (a caption too large for its wrapper
+falls back to a plain `CAPTION_UPDATE`), then live updates. The browser's
+resume cursor only advances over a contiguous run of finals, so a recovery
+batch starting above a gap cannot skip a missed final. Reconnects use
+jittered exponential backoff (1 s doubling to a 10 s cap, reset only after a
+connection survives longer than the cap).
+
+**Per-client buffering/backpressure.** Each client has one bounded queue
+(`MAX_PENDING = 128` messages / 256 KiB) drained by a sole sender task, so a
+blocked client can never stall ingestion or other clients. Because a
+successful `send()` is not proof of application consumption, the sender
+issues ping/pong delivery checkpoints (every 1 s / 8 messages / 16 KiB, with
+a 10 s timeout and a bounded in-flight window) to detect receiver congestion
+hiding below the transport buffers.
+
+**Overload behavior and trade-offs.** Under observed lag the server coalesces
+semantically: obsolete provisional revisions are dropped, while finals and
+the newest active revision are always preserved, and a probation window
+restores full-update delivery once the client sustains healthy checkpoints.
+Measured on Ubuntu (controlled before/after comparison, T3 workload): final
+completeness 95.13% -> 100.00% and slow-client P95 28,109.67 ms -> 594.17 ms,
+at the cost of +13.50 ms normal-client P95 — more useful final state for slow
+readers in exchange for protocol/framing overhead. Details in
+`docs/PUBLIC_TESTS_GUIDE.md` (controlled comparison) and
+`docs/safe_cleanup_audit.md`.
 
 ## Optional ASR bonus
 
-Only if attempted. Keep these dependencies separate from the mandatory server path.
+Not attempted. The mandatory path has no ASR dependencies; `bonus_asr/`
+contains guidance only, and model weights are gitignored.
