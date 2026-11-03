@@ -712,16 +712,24 @@ class ClientState:
             self.in_flight_sequence = 0
         return size
 
-    async def run(self, history: list[dict[str, Any]]) -> None:
+    async def _drain_history(self, history: list[dict[str, Any]]) -> bool:
+        """Send the recovery snapshot; False if the client failed mid-drain."""
         # Establish path RTT before HISTORY can fill the peer's receive queue.
         await self._checkpoint(0)
         for message in history_messages(history):
             if self._aborted():
-                return
+                return False
             size = await self._send(message)
             await self._delivery_checkpoint(size)
             await asyncio.sleep(0)
-        del history, message
+        return True
+
+    async def run(self, history: list[dict[str, Any]]) -> None:
+        if not await self._drain_history(history):
+            return
+        # Drop the last reference so the snapshot is not pinned for the
+        # connection's lifetime.
+        del history
         while not self.failed.is_set():
             if self._aborted():
                 break
