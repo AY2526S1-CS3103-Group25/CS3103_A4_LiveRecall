@@ -279,6 +279,27 @@ test("reconnect backoff caps at 10 s, jitters, and resets only after a surviving
   assert.match(c.status.textContent, /reconnecting \(attempt 2\)/);
 });
 
+test("an outage after a long-lived open keeps escalating, not stuck at attempt 1", () => {
+  const c = client();
+  // A connection that survives past the cap, then the server goes away for
+  // good. The first close earns a fresh backoff; the refused dials that
+  // follow must not, or the client hammers a down server at a steady 1 Hz.
+  c.open();
+  c.advance(11000);
+  c.close();
+  assert.match(c.status.textContent, /reconnecting \(attempt 1\)/);
+  // Each redial is refused (no open), so the old open must stop counting.
+  c.advance(1001);
+  c.close();
+  assert.match(c.status.textContent, /reconnecting \(attempt 2\)/);
+  c.advance(2001);
+  c.close();
+  assert.match(c.status.textContent, /reconnecting \(attempt 3\)/);
+  c.advance(4001);
+  c.close();
+  assert.match(c.status.textContent, /reconnecting \(attempt 4\)/);
+});
+
 test("a late close from a replaced socket cannot schedule a duplicate reconnect", () => {
   const c = client();
   c.close(); // socket 1 -> attempt 1, timer at most 1 s away
