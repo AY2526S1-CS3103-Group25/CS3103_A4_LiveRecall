@@ -8,6 +8,8 @@ const CLEANUP_INTERVAL_MS = 5_000;
 // that is still down is not hammered; a successful open resets the counter.
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 10000;
+// Recovery context requested in CLIENT_HELLO; the server clamps to [0, 60].
+const HELLO_HISTORY_SECONDS = 30;
 const statusEl = document.getElementById("status");
 const liveEl = document.getElementById("live");
 const liveEmptyEl = document.getElementById("live-empty");
@@ -297,7 +299,7 @@ function connect() {
       session: "L1",
       last_segment: contiguousFinal.segment,
       last_revision: contiguousFinal.revision,
-      history_seconds: 30
+      history_seconds: HELLO_HISTORY_SECONDS
     }));
   });
 

@@ -4,12 +4,7 @@ CS3103 Assignment 4 - LiveRecall revision-aware caption server.
 
 Bounded recent history and per-client delivery preserve finalized captions while
 coalescing obsolete provisional revisions only when a client falls behind.
-
-Required evaluator command:
-    python solution_server.py --port 8765
-
-Teams should replace or substantially extend the implementation while keeping
-this command-line interface and the protocol in the assignment specification.
+Evaluator command: python solution_server.py --port 8765
 """
 
 from __future__ import annotations
@@ -37,6 +32,10 @@ DEFAULT_HISTORY_SECONDS = 30
 MAX_HISTORY_SECONDS = 60
 
 
+def log(*args: Any) -> None:
+    print(*args, flush=True)
+
+
 @dataclass(frozen=True, slots=True)
 class CaptionUpdate:
     """A validated CAPTION_UPDATE.
@@ -49,9 +48,7 @@ class CaptionUpdate:
 
     segment: int
     revision: int
-    source_ts: float
     final: bool
-    text: str
     payload: str
 
 
@@ -85,8 +82,8 @@ class SessionState:
         self._history: deque[tuple[float, CaptionUpdate, dict[str, Any]]] = deque()
         # Receipt-order final positions let senders recover even out-of-order
         # segment finals, without a growing per-client set of delivered IDs.
-        self._final_sequence = 0
-        self._expired_sequence = 0
+        self.final_sequence = 0
+        self.expired_sequence = 0
         self._active: dict[int, CaptionUpdate] = {}
         self.generation = object()
         self._done = False  # previous source completed with SOURCE_DONE
@@ -110,33 +107,30 @@ class SessionState:
         one, the segment-1 fallback in apply() catches it.
         """
         if self._done:
-            print(
-                f"new source after SOURCE_DONE: resetting ({self.drop_summary()})",
-                flush=True,
-            )
+            log(f"new source after SOURCE_DONE: resetting ({self.drop_summary()})")
             self.__init__()
         self._stream_started = False
 
     def on_source_done(self) -> None:
         self._done = True
 
+    def _is_new_stream(self, update: CaptionUpdate) -> bool:
+        # A provisional s1r1 as a connection's first frame while segment 1 is
+        # already closed can only be a new stream (a full source replay is
+        # indistinguishable from one here).
+        return (not self._stream_started
+                and update.segment == 1
+                and update.revision == 1
+                and not update.final
+                and self._closed_up_to >= 1
+                and 1 not in self._reopenable)
+
     def apply(self, update: CaptionUpdate) -> bool:
         """Atomically record accepted revisions for delivery."""
         seg = update.segment
-        # A full source replay is indistinguishable from a new stream here.
-        if (
-            not self._stream_started
-            and seg == 1
-            and update.revision == 1
-            and not update.final
-            and self._closed_up_to >= 1
-            and 1 not in self._reopenable
-        ):
-            print(
-                "stream opens at segment 1 revision 1 but segment 1 is closed: "
-                f"treating as a new stream, resetting ({self.drop_summary()})",
-                flush=True,
-            )
+        if self._is_new_stream(update):
+            log("stream opens at segment 1 revision 1 but segment 1 is closed: "
+                f"treating as a new stream, resetting ({self.drop_summary()})")
             self.__init__()
         self._stream_started = True
         if seg <= self._closed_up_to:
@@ -172,24 +166,22 @@ class SessionState:
     def _remember_final(self, update: CaptionUpdate) -> None:
         self.prune_history()
         self._active.pop(update.segment, None)
-        self._final_sequence += 1
+        self.final_sequence += 1
         self._history.append((time.monotonic(), update, json.loads(update.payload)))
 
     def prune_history(self) -> None:
         cutoff = time.monotonic() - self.HISTORY_RETENTION_SECONDS
         while self._history and self._history[0][0] <= cutoff:
             self._history.popleft()
-            self._expired_sequence += 1
+            self.expired_sequence += 1
 
     def history_items(
         self, last_segment: int, last_revision: int, history_seconds: float
     ) -> list[dict[str, Any]]:
         """Snapshot missed finals in segment order, within receipt time.
 
-        The cursor reports the latest finalized state held by the client.
-        Use the same monotonic receipt clock for retention and selection: source
-        and server wall clocks need not agree. Original timestamps and extra
-        fields remain unchanged in the response.
+        Retention and selection use the same monotonic receipt clock: source
+        and server wall clocks need not agree.
         """
         self.prune_history()
         if history_seconds <= 0:
@@ -204,18 +196,10 @@ class SessionState:
             updates, key=lambda entry: entry[0].segment
         )]
 
-    @property
-    def final_sequence(self) -> int:
-        return self._final_sequence
-
-    @property
-    def expired_sequence(self) -> int:
-        return self._expired_sequence
-
     def final_after(self, sequence: int) -> CaptionUpdate | None:
         """Read the next retained final; callers first check expiry."""
-        if sequence < self._final_sequence:
-            return self._history[sequence - self._expired_sequence][1]
+        if sequence < self.final_sequence:
+            return self._history[sequence - self.expired_sequence][1]
         return None
 
     def active_updates(self) -> list[CaptionUpdate]:
@@ -276,12 +260,10 @@ def _is_positive_int(value: Any) -> bool:
 def _finite_float(value: Any) -> float | None:
     """Coerce a JSON number to a finite float, or None if it is not one.
 
-    JSON integers have arbitrary precision, so the conversion to a C double
-    can itself overflow (`float(10 ** 400)` raises OverflowError, and so does
-    `math.isfinite` on the same value). The guard keeps an absurd timestamp a
-    dropped field rather than an exception that would kill the connection.
+    Arbitrary-precision JSON integers can overflow the conversion itself
+    (`float(10 ** 400)` raises OverflowError); keep that a dropped field
+    rather than an exception that would kill the connection.
     """
-    # bool is a subclass of int, so it must be rejected explicitly.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     try:
@@ -294,14 +276,10 @@ def _finite_float(value: Any) -> float | None:
 def _decode_source_frame(raw: str | bytes) -> tuple[Any, str]:
     """Decode a source frame into (message, payload to forward).
 
-    `json.loads` accepts the JavaScript-only `NaN`/`Infinity`/`-Infinity`
-    literals and `json.dumps` re-emits them, but they are not valid JSON:
-    a browser's `JSON.parse` rejects the entire frame, so a caption carrying
-    one in any field — including an unknown extra one we never look at —
-    would be lost. Large exponents such as 1e400 also decode to infinity in
-    Python and can become invalid JSON when another field is patched. Both
-    cases are replaced with null before re-serialization. Ordinary text frames
-    retain their original payload.
+    Python's json accepts `NaN`/`Infinity` literals (and 1e400 decodes to
+    infinity), but a browser's `JSON.parse` rejects the whole frame — the
+    caption would be lost. Non-finite numbers in any field are rewritten to
+    null before re-serialization; ordinary frames keep their original payload.
     """
     if isinstance(raw, bytes):
         # Keep the decoder's existing acceptance of a UTF-8 BOM.
@@ -322,24 +300,18 @@ def _decode_source_frame(raw: str | bytes) -> tuple[Any, str]:
     )
     if not seen:
         return msg, raw
-    print(f"rewrote non-finite number(s) to null: {', '.join(seen)}", flush=True)
+    log(f"rewrote non-finite number(s) to null: {', '.join(seen)}")
     return msg, json.dumps(msg, allow_nan=False)
 
 
 def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
     """Validate a decoded CAPTION_UPDATE; return None (and log) if malformed.
 
-    Shape validation only: segment/revision monotonicity is session state,
-    not ingestion. Extra/unknown fields are ignored. Never raises.
-
-    The identity fields (segment, revision, final) are strict: without them
-    the update cannot be displayed or deduplicated. source_ts (only used for
-    age metrics) and text (display content) are lenient — a missing/invalid
-    value is defaulted and the payload patched, because dropping a possibly
-    final caption over a non-identity field is unrecoverable. The update's
-    `session` field is not checked: the session is identified by the source
-    connection's SOURCE_HELLO, and the spec doesn't require per-update
-    session matching.
+    Shape validation only: extra/unknown fields are ignored; never raises.
+    Identity fields (segment, revision, final) are strict — without them the
+    update cannot be displayed or deduplicated. source_ts and text are
+    lenient (defaulted, payload patched), because dropping a possibly final
+    caption over a non-identity field is unrecoverable.
     """
     reason = None
     segment = msg.get("segment")
@@ -355,7 +327,7 @@ def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
         reason = f"final must be a bool, got {final!r}"
 
     if reason is not None:
-        print(f"dropping malformed CAPTION_UPDATE: {reason}", flush=True)
+        log(f"dropping malformed CAPTION_UPDATE: {reason}")
         return None
 
     source_ts = _finite_float(msg.get("source_ts"))
@@ -370,29 +342,20 @@ def parse_caption_update(msg: dict[str, Any], raw: str) -> CaptionUpdate | None:
     payload = raw
     if patched:
         payload = json.dumps({**msg, **patched})
-        print(
-            f"CAPTION_UPDATE segment={segment} revision={revision}: "
-            f"defaulted missing/invalid {', '.join(patched)}",
-            flush=True,
-        )
+        log(f"CAPTION_UPDATE segment={segment} revision={revision}: "
+            f"defaulted missing/invalid {', '.join(patched)}")
 
     return CaptionUpdate(
-        segment=segment,
-        revision=revision,
-        source_ts=source_ts,
-        final=final,
-        text=text,
-        payload=payload,
+        segment=segment, revision=revision, final=final, payload=payload
     )
 
 
 def history_messages(items: list[dict[str, Any]]) -> Iterator[str]:
-    """Emit lossless recovery batches before live delivery, one message at a time.
+    """Emit lossless recovery batches; always yields at least one HISTORY.
 
-    The 70-second retention window is unchanged. Batching bounds wire messages
-    rather than throwing away finals to make the whole window fit one message.
-    An item that fits alone but not inside HISTORY uses CAPTION_UPDATE after an
-    initial HISTORY reply; the existing client accept path handles either form.
+    Batching bounds wire messages rather than throwing away finals. An item
+    that fits alone but not inside the HISTORY wrapper is sent as a bare
+    CAPTION_UPDATE after an initial HISTORY reply.
     """
     prefix, suffix = '{"type":"HISTORY","items":[', ']}'
     empty_size = len(prefix) + len(suffix)
@@ -424,10 +387,11 @@ def history_messages(items: list[dict[str, Any]]) -> Iterator[str]:
 
 
 class ClientState:
-    # Live pending work is capped by count and UTF-8 bytes. The initial recovery
-    # snapshot shares retained records; it is encoded one bounded batch at a time.
-    # The snapshot references and one in-flight frame are outside the live budget.
-    # Oversized valid frames use catch-up's single-frame path, never the queue.
+    """Per-client bounded delivery: pending live work is capped by count and
+    UTF-8 bytes; the recovery snapshot shares retained records and is encoded
+    one bounded batch at a time; oversized valid frames use catch-up's
+    single-frame path, never the queue."""
+
     MAX_PENDING = 128
     MAX_PENDING_BYTES = 256 * 1024
     LAG_SECONDS = 0.100
@@ -588,7 +552,7 @@ class ClientState:
             # input. The connection's receive task may not have finished yet.
             self.failed.set()
         except Exception as exc:
-            print(f"client checkpoint failed: {exc!r}", flush=True)
+            log(f"client checkpoint failed: {exc!r}")
             self.fail("Peer checkpoint failed; reconnect")
 
     async def _delivery_checkpoint(self, size: int) -> None:
@@ -622,7 +586,7 @@ class ClientState:
             self.checkpoint_messages += bool(size)
             self.checkpoint_bytes += size
 
-    async def _wait_provisional(self, queued_at: float) -> bool:
+    async def _wait_provisional(self, queued_at: float = 0.0) -> bool:
         if not self.provisional_hold:
             return False
         delay = max(queued_at + self.provisional_hold,
@@ -653,6 +617,10 @@ class ClientState:
               < SESSION.expired_sequence):
             self.fail("Final recovery window expired; reconnect")
 
+    def _aborted(self) -> bool:
+        self.check_recovery()
+        return self.failed.is_set()
+
     def _observe_lag(self, drop_segment: int | None = None) -> None:
         now = time.monotonic()
         if ((self.send_started is not None
@@ -677,8 +645,7 @@ class ClientState:
                 self.pending = kept
 
     def offer(self, update: CaptionUpdate, size: int) -> None:
-        self.check_recovery()
-        if self.failed.is_set():
+        if self._aborted():
             return
         if self.catch_up:
             self.ready.set()
@@ -706,8 +673,7 @@ class ClientState:
 
     def _next_recovery(self) -> tuple[CaptionUpdate, int] | None:
         SESSION.prune_history()
-        self.check_recovery()
-        if self.failed.is_set():
+        if self._aborted():
             return None
         update = SESSION.final_after(self.final_cursor)
         if update is not None:
@@ -724,8 +690,7 @@ class ClientState:
         return None
 
     async def _send(self, payload: str, sequence: int = 0) -> int:
-        size = (len(payload.encode('utf-8'))
-                if isinstance(payload, str) else len(payload))
+        size = len(payload.encode('utf-8'))
         self.send_started = time.monotonic()
         self.in_flight_sequence = sequence
         try:
@@ -747,20 +712,26 @@ class ClientState:
             self.in_flight_sequence = 0
         return size
 
-    async def run(self, history: list[dict[str, Any]]) -> None:
+    async def _drain_history(self, history: list[dict[str, Any]]) -> bool:
+        """Send the recovery snapshot; False if the client failed mid-drain."""
         # Establish path RTT before HISTORY can fill the peer's receive queue.
         await self._checkpoint(0)
         for message in history_messages(history):
-            self.check_recovery()
-            if self.failed.is_set():
-                return
+            if self._aborted():
+                return False
             size = await self._send(message)
             await self._delivery_checkpoint(size)
             await asyncio.sleep(0)
-        del history, message
+        return True
+
+    async def run(self, history: list[dict[str, Any]]) -> None:
+        if not await self._drain_history(history):
+            return
+        # Drop the last reference so the snapshot is not pinned for the
+        # connection's lifetime.
+        del history
         while not self.failed.is_set():
-            self.check_recovery()
-            if self.failed.is_set():
+            if self._aborted():
                 break
             # Pipeline within the measured path RTT, but stop adding transport
             # work when feedback is overdue. This wait doesn't itself classify
@@ -776,7 +747,7 @@ class ClientState:
             if recovery is not None:
                 update, sequence = recovery
                 if (not update.final
-                        and await self._wait_provisional(0)):
+                        and await self._wait_provisional()):
                     continue
             elif self.pending:
                 if self.provisional_hold:
@@ -828,8 +799,7 @@ async def ingest_caption_update(update: CaptionUpdate) -> None:
     """Commit accepted state and offer work without awaiting client I/O."""
     if not SESSION.apply(update):
         return
-    size = (len(update.payload.encode("utf-8"))
-            if isinstance(update.payload, str) else len(update.payload))
+    size = len(update.payload.encode("utf-8"))
     for client in CLIENTS.values():
         client.offer(update, size)
 
@@ -839,7 +809,7 @@ async def handle_source(ws: Any, hello: dict[str, Any]) -> None:
     # session, SOURCE_HELLO's type already routes the connection, and refusing
     # the only source over a missing label would stop every caption.
     session = hello.get("session")
-    print(f"source connected: session={session!r}", flush=True)
+    log(f"source connected: session={session!r}")
     SESSION.on_source_connect()
 
     try:
@@ -863,20 +833,31 @@ async def handle_source(ws: Any, hello: dict[str, Any]) -> None:
             elif msg_type == "SOURCE_DONE":
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
-                print(f"source finished: segments={msg.get('segments')}", flush=True)
+                log(f"source finished: segments={msg.get('segments')}")
                 SESSION.on_source_done()
             else:
                 # Forward compatibility: ignore fields/messages this baseline
                 # doesn't understand rather than crashing.
                 continue
     finally:
-        print(f"source disconnected: {SESSION.drop_summary()}", flush=True)
+        log(f"source disconnected: {SESSION.drop_summary()}")
+
+
+def _wants_fragments(ws: Any) -> bool:
+    # Older Python websockets receivers can crash when recv() times out during
+    # fragmentation (upstream #1773, fixed in 17.3). This advisory compatibility
+    # guard is not authentication: absent/unknown UAs use the plain-frame policy.
+    request = getattr(ws, 'request', None)
+    headers = request.headers if request is not None else getattr(ws, 'request_headers', {})
+    version = re.search(r'(?:^| )websockets/(\d{1,3})\.(\d{1,3})(?:\.\d{1,3})?(?: |$)',
+                        headers.get('User-Agent', ''))
+    return bool(version and tuple(map(int, version.groups())) >= (17, 3))
 
 
 async def handle_client(ws: Any, hello: dict[str, Any]) -> None:
     client_id = hello.get("client_id")
-    last_segment = hello.get("last_segment", 0)
-    last_revision = hello.get("last_revision", 0)
+    last_segment = hello.get("last_segment")
+    last_revision = hello.get("last_revision")
     last_segment = last_segment if _is_positive_int(last_segment) else 0
     last_revision = last_revision if _is_positive_int(last_revision) else 0
     seconds = _finite_float(hello.get("history_seconds"))
@@ -885,15 +866,7 @@ async def handle_client(ws: Any, hello: dict[str, Any]) -> None:
     # Snapshot and registration are synchronous. The sender owns HISTORY and
     # every subsequent live send; source ingestion never waits for either.
     items = SESSION.history_items(last_segment, last_revision, seconds)
-    # Older Python websockets receivers can crash when recv() times out during
-    # fragmentation (upstream #1773, fixed in 17.3). This advisory compatibility
-    # guard is not authentication: absent/unknown UAs use the plain-frame policy.
-    request = getattr(ws, 'request', None)
-    headers = request.headers if request is not None else getattr(ws, 'request_headers', {})
-    version = re.search(r'(?:^| )websockets/(\d{1,3})\.(\d{1,3})(?:\.\d{1,3})?(?: |$)',
-                        headers.get('User-Agent', ''))
-    fragment_checkpoints = bool(version and tuple(map(int, version.groups())) >= (17, 3))
-    client = ClientState(ws, fragment_checkpoints=fragment_checkpoints)
+    client = ClientState(ws, fragment_checkpoints=_wants_fragments(ws))
     CLIENTS[ws] = client
     sender = asyncio.create_task(client.run(items))
     del items
@@ -904,7 +877,7 @@ async def handle_client(ws: Any, hello: dict[str, Any]) -> None:
 
     reader = asyncio.create_task(receive())
     failure = asyncio.create_task(client.failed.wait())
-    print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+    log(f"client connected: id={client_id}; clients={len(CLIENTS)}")
     try:
         done, _ = await asyncio.wait(
             (sender, reader, failure), return_when=asyncio.FIRST_COMPLETED
@@ -914,7 +887,7 @@ async def handle_client(ws: Any, hello: dict[str, Any]) -> None:
     except ConnectionClosed:
         pass
     except Exception as exc:
-        print(f"client delivery failed: {exc!r}", flush=True)
+        log(f"client delivery failed: {exc!r}")
         client.fail("Client delivery failed; reconnect")
         raise
     finally:
@@ -931,9 +904,9 @@ async def handle_client(ws: Any, hello: dict[str, Any]) -> None:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-        print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}; "
-              f"coalesced={client.coalesced}; catch_ups={client.catch_ups}; "
-              f"reason={client.failure_reason!r}", flush=True)
+        log(f"client disconnected: id={client_id}; clients={len(CLIENTS)}; "
+            f"coalesced={client.coalesced}; catch_ups={client.catch_ups}; "
+            f"reason={client.failure_reason!r}")
 
 
 async def handler(ws: Any) -> None:
@@ -943,8 +916,7 @@ async def handler(ws: Any) -> None:
     except (asyncio.TimeoutError, ValueError):
         # ValueError covers JSONDecodeError and UnicodeDecodeError (a binary
         # hello frame with invalid UTF-8).
-        await ws.close(code=1008, reason="Expected a valid hello message")
-        return
+        hello = None
     if not isinstance(hello, dict):
         await ws.close(code=1008, reason="Expected a valid hello message")
         return
@@ -977,7 +949,7 @@ async def main_async(port: int) -> None:
         ping_interval=20,
         ping_timeout=20,
     ):
-        print(f"LiveRecall listening on ws://0.0.0.0:{port}", flush=True)
+        log(f"LiveRecall listening on ws://0.0.0.0:{port}")
         cleanup = asyncio.create_task(prune_history_periodically())
         try:
             await asyncio.Future()

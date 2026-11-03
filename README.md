@@ -107,10 +107,10 @@ about 70–75 seconds. An accepted newer revision or final clears the stale labe
 rejected updates do not refresh the timer. A late final or newer revision can
 restore a removed provisional caption. Only the revision and final status of
 removed captions are temporarily remembered to reject stale updates; these
-records also expire after about 70 seconds. This guard does not implement
-reconnect recovery or history
-merging; the reconnect follow-up must send the actual latest finalized segment
-and revision in `CLIENT_HELLO`.
+records also expire after about 70 seconds. On reconnect the client resumes by
+sending its highest contiguous finalized segment and revision in `CLIENT_HELLO`,
+and recovered `HISTORY` items merge through this same accept path, so the guard
+above also deduplicates recovery bursts.
 
 ### What did I miss? — local recall (issue #7)
 
@@ -155,9 +155,10 @@ python caption_source.py --duration 120
    detected on the next cleanup tick; retained final state expires after about
    70–75 seconds.
 
-Automatic reconnect, finalized resume positions, and merging recovered `HISTORY`
-items remain separate follow-up work. The existing connection hello requests
-initial recovery context, but recall selection itself never queries the server.
+Automatic reconnect (jittered exponential backoff), finalized resume positions
+(the contiguous-final cursor sent in `CLIENT_HELLO`), and merging recovered
+`HISTORY` items are all implemented in `client/app.js`; recall selection itself
+never queries the server.
 
 To repeat the test, reload both tabs, wait for **connected**, then run the
 Terminal 3 command again. Reloading clears the previous captions. Press
